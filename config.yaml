@@ -1,0 +1,53 @@
+# Orderly Network LLM Trading System Configuration
+
+symbols:
+  - PERP_ETH_USDC
+  - PERP_BTC_USDC
+  - PERP_SOL_USDC
+
+analysis_interval_seconds: 300  # 5 minutes
+initial_budget: 1000.0
+paper_trading: true
+
+# OpenRouter LLM configuration
+openrouter:
+  # api_key: set via OPENROUTER_API_KEY environment variable
+  base_url: https://openrouter.ai/api/v1
+  model: x-ai/grok-3-mini
+  reasoning_effort: high
+  max_tokens: 4096
+  temperature: 0.2
+  timeout: 60.0
+
+# Risk management
+risk:
+  max_loss_per_trade_pct: 0.02  # 2% per trade
+  max_total_exposure_pct: 0.80
+  min_sl_atr_multiple: 0.5
+  max_sl_atr_multiple: 3.0
+  drawdown_reduce_pct: 0.10  # Reduce at 10% drawdown
+  drawdown_halt_pct: 0.20    # Halt at 20% drawdown
+
+  reserve:
+    free_pct: 0.70
+    guarded_pct: 0.20
+    guarded_win_rate: 0.45
+    guarded_min_trades: 20
+    guarded_max_losing_streak: 3
+    guarded_min_confidence: 0.75
+    guarded_min_rr: 2.0
+    guarded_max_leverage: 3.0
+    floor_pct: 0.05
+    floor_win_rate: 0.60
+    floor_min_trades: 30
+    floor_min_confidence: 0.9
+    floor_min_rr: 3.0
+    lockout_pct: 0.05
+
+# Network (mainnet)
+testnet: false
+rest_base_url: https://api-evm.orderly.org
+orderly_account_id: "0xf98092b3dbe8f67ffa7171e520e97b7d506efb5d3106c93a9c63a86688cd62bc"
+
+log_level: INFO
+store_reasoning: true
