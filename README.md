@@ -1,31 +1,37 @@
 # Orderly Trader
 
-LLM-powered perpetual futures trading system on Orderly Network. Connects to real-time WebSocket market data, computes technical indicators, sends structured snapshots to an LLM (Grok via OpenRouter), and executes validated trading decisions.
+Perpetual futures trading system on Orderly Network with a callable Python API. Connects to real-time WebSocket market data, computes technical indicators, and exposes functions for an LLM to analyze markets and execute validated trading decisions via the x402 VoltPerps API.
 
 ## Architecture
 
 ```
-Orderly WS (x3 symbols) → DataCollectors → MarketSnapshots → Indicators → LLM → TradeDecisions → RiskManager → Execute/Reject
+Orderly WS (x3 symbols) → DataCollectors → MarketSnapshots → Indicators → LLM Prompt
+                                                                              ↓
+                                                              LLM analyzes + produces JSON
+                                                                              ↓
+                                                          RiskManager validates → Execute/Reject
+                                                                              ↓
+                                                          x402 VoltPerps API → Real order on Orderly
 ```
 
 - **3 symbols**: PERP_ETH_USDC, PERP_BTC_USDC, PERP_SOL_USDC
 - **3 timeframes**: 5m, 15m, 1h
-- **Analysis every 5 minutes**: all symbols in one LLM call for cross-asset correlation
+- **LLM-controlled cadence**: call `get_prompt()` whenever you want a new analysis
 - **9-layer risk manager** with graduated reserve system has absolute veto power
 
 ## Project Structure
 
 ```
 orderly-trader/
-├── config.yaml                 # Runtime configuration (symbols, model, risk params)
+├── config.yaml                 # Runtime configuration (symbols, risk params)
+├── SKILL.md                    # Full skill document: how the LLM uses this system
 ├── prompt_template.md          # Standalone LLM prompt (works with any LLM)
-├── STRATEGY.md                 # Full strategy design document
 ├── pyproject.toml
 ├── src/
-│   ├── main.py                 # Async main loop
+│   ├── main.py                 # TradingSystem class (callable API)
 │   ├── collector.py            # Per-symbol WebSocket data collector
 │   ├── indicators.py           # RSI, MACD, BB, EMA, VWAP, ATR (pure numpy)
-│   ├── strategy.py             # Multi-symbol prompt builder + LLM response parser
+│   ├── strategy.py             # Multi-symbol prompt builder + response parser
 │   ├── risk_manager.py         # Graduated reserve + 9-layer validation
 │   ├── models/
 │   │   ├── market.py           # KlineBuffer, OrderbookSnapshot, MarketSnapshot
@@ -33,8 +39,7 @@ orderly-trader/
 │   │   ├── position.py         # Position, PortfolioState
 │   │   └── config.py           # Pydantic config validation
 │   └── adapters/
-│       ├── base.py             # Abstract LLM adapter interface
-│       └── openrouter_adapter.py  # OpenRouter API client (any model)
+│       └── base.py             # LLMResponse data structure
 ├── tests/
 │   ├── test_indicators.py      # 20 tests
 │   ├── test_risk_manager.py    # 16 tests
@@ -46,22 +51,40 @@ orderly-trader/
 ## Prerequisites
 
 - Python 3.11+
-- An [OpenRouter](https://openrouter.ai/) API key
 - An Orderly Network account ID (for WebSocket data feeds)
 
 ## Setup
 
 ```bash
-# Clone and enter the project
 cd orderly-trader
-
-# Create virtual environment
 python3 -m venv .venv
 source .venv/bin/activate
-
-# Install dependencies
 pip install -e ".[dev]"
 ```
+
+## Usage
+
+The system exposes a `TradingSystem` class with callable methods:
+
+```python
+from src.main import TradingSystem
+
+system = TradingSystem()
+await system.start()           # Connects WebSockets, backfills kline data
+
+# Each analysis cycle:
+prompt = system.get_prompt()   # Returns {system_prompt, user_prompt, sl_tp_events}
+# LLM reads the prompt, analyzes, produces JSON decision
+result = system.submit_decision('{"decisions": [...]}')
+
+# Anytime:
+system.check_stops()           # Check SL/TP on open positions
+system.get_status()            # Portfolio summary
+
+await system.stop()            # Shutdown
+```
+
+See **[SKILL.md](SKILL.md)** for the full skill document with trading rules, signal analysis, and x402 API execution format.
 
 ## Configuration
 
@@ -73,23 +96,14 @@ symbols:
   - PERP_BTC_USDC
   - PERP_SOL_USDC
 
-analysis_interval_seconds: 300  # 5 minutes
 initial_budget: 1000.0
 paper_trading: true
 
-openrouter:
-  # api_key: set via OPENROUTER_API_KEY environment variable
-  base_url: https://openrouter.ai/api/v1
-  model: x-ai/grok-3-mini
-  reasoning_effort: high
-  max_tokens: 4096
-  temperature: 0.2
-
 risk:
-  max_loss_per_trade_pct: 0.02    # 2% per trade
-  max_total_exposure_pct: 0.80    # 80% max exposure
-  drawdown_reduce_pct: 0.10      # Reduce size at 10% drawdown
-  drawdown_halt_pct: 0.20        # Halt trading at 20% drawdown
+  max_loss_per_trade_pct: 0.02
+  max_total_exposure_pct: 0.80
+  drawdown_reduce_pct: 0.10
+  drawdown_halt_pct: 0.20
 
 testnet: false
 orderly_account_id: "your_orderly_account_id_here"
@@ -98,76 +112,24 @@ log_level: INFO
 store_reasoning: true
 ```
 
-### Environment Variables
-
-```bash
-export OPENROUTER_API_KEY="sk-or-..."
-```
-
-## Running
-
-```bash
-# Start the trading system
-OPENROUTER_API_KEY=sk-or-... python -m src.main
-```
-
-The system will:
-1. Backfill historical klines via REST API
-2. Connect to Orderly WebSocket for real-time data (3 symbols)
-3. Every 5 minutes: compute indicators → call LLM → validate → execute
-4. Check SL/TP on all positions every cycle
-5. Log full audit trail to `logs/cycles_YYYYMMDD.jsonl`
-
-### Log Output
-
-```
-INFO  Backfilling PERP_ETH_USDC...
-INFO  WebSocket connected for PERP_ETH_USDC
-INFO  === Analysis Cycle 1 ===
-INFO  PERP_ETH_USDC LONG: Bullish EMA alignment... (approved=True, lev=5.0, qty=0.0380)
-INFO  PERP_BTC_USDC HOLD: Mixed signals... (approved=True, lev=1.0, qty=0.0000)
-INFO  Opened PERP_ETH_USDC LONG @ 2018.92 qty=0.0380 lev=5.0x margin=$153.44
-```
-
 ## Running Tests
 
 ```bash
-# All 48 tests
-python -m pytest tests/ -v
-
-# Specific test file
-python -m pytest tests/test_risk_manager.py -v
-
-# Quick run
-python -m pytest tests/ -q
+python -m pytest tests/ -v      # All 48 tests
+python -m pytest tests/ -q      # Quick run
 ```
-
-## Switching LLM Models
-
-Change the `model` field in `config.yaml` to any OpenRouter-supported model:
-
-```yaml
-openrouter:
-  model: x-ai/grok-3-mini          # Default — returns reasoning chain
-  # model: anthropic/claude-sonnet-4-20250514
-  # model: openai/gpt-4o
-  # model: deepseek/deepseek-chat
-```
-
-No code changes needed. The prompt in `prompt_template.md` works with any LLM.
 
 ## Key Design Decisions
 
 | Decision | Why |
 |----------|-----|
-| OpenRouter (single adapter) | One API for every model. Switch via config. |
-| Grok 3 Mini + reasoning | Returns readable reasoning chain for audit |
+| Callable API (not autonomous loop) | LLM controls the cadence and makes decisions directly |
 | Pure numpy for indicators | 10x lighter than pandas for fixed-size buffers |
-| Multi-symbol single LLM call | LLM sees cross-symbol correlations |
+| Multi-symbol single prompt | LLM sees cross-symbol correlations |
 | Graduated reserve system | Capital-efficient. Reserve unlocks based on proven performance. |
 | Error → HOLD | System never acts when confused |
 
 ## Documentation
 
-- **[STRATEGY.md](STRATEGY.md)** — Full strategy design: signal categories, decision matrix, risk management, x402 API execution format
+- **[SKILL.md](SKILL.md)** — Full skill document: trading rules, signal analysis, x402 API execution
 - **[prompt_template.md](prompt_template.md)** — Standalone LLM prompt (can be used directly with any LLM)
