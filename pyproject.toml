@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "orderly-trader"
 version = "0.1.0"
-description = "LLM-powered trading strategy for Orderly Network perpetual futures"
+description = "Trading system for Orderly Network perpetual futures with callable Python API"
 requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.26",

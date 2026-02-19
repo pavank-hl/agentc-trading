@@ -11,7 +11,6 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .adapters.base import BaseLLMAdapter
 from .indicators import IndicatorReport, compute_indicators
 from .models.config import TradingConfig
 from .models.decision import (
@@ -130,44 +129,66 @@ class StrategyEngine:
     def __init__(
         self,
         config: TradingConfig,
-        llm: BaseLLMAdapter,
         portfolio: PortfolioState,
     ) -> None:
         self.config = config
-        self.llm = llm
         self.portfolio = portfolio
         self.risk_manager = RiskManager(config)
         self.cycles: list[AnalysisCycle] = []
+        # Intermediate state between prepare_analysis and process_response
+        self._pending_reports: dict[str, IndicatorReport] = {}
+        self._pending_prices: dict[str, float] = {}
 
-    async def run_cycle(
+    def prepare_analysis(
         self,
         snapshots: dict[str, MarketSnapshot],
         prices: dict[str, float],
+    ) -> tuple[str, str]:
+        """Phase 1: Compute indicators and build prompts.
+
+        Returns (system_prompt, user_prompt) for the LLM to analyze.
+        Call process_response() with the LLM's JSON output afterwards.
+        """
+        # Compute indicators for each symbol
+        reports: dict[str, IndicatorReport] = {}
+        for symbol, snap in snapshots.items():
+            reports[symbol] = compute_indicators(snap)
+
+        # Build prompt
+        user_prompt = self._build_user_prompt(reports, prices)
+        logger.debug("User prompt (%d chars):\n%s", len(user_prompt), user_prompt)
+
+        # Stash state for process_response
+        self._pending_reports = reports
+        self._pending_prices = prices
+
+        return SYSTEM_PROMPT, user_prompt
+
+    def process_response(
+        self,
+        response_text: str,
     ) -> list[ValidatedDecision]:
-        """Run one full analysis cycle for all symbols."""
+        """Phase 2: Parse JSON response, validate through risk manager, execute.
+
+        Args:
+            response_text: Raw JSON string with trading decisions.
+
+        Returns:
+            List of validated (and possibly executed) decisions.
+        """
+        reports = self._pending_reports
+        prices = self._pending_prices
+
         cycle = AnalysisCycle(
             portfolio_state_before=self.portfolio.to_summary_dict(prices),
         )
 
         try:
-            # 1. Compute indicators for each symbol
-            reports: dict[str, IndicatorReport] = {}
-            for symbol, snap in snapshots.items():
-                reports[symbol] = compute_indicators(snap)
-
-            # 2. Build prompt
-            user_prompt = self._build_user_prompt(reports, prices)
-            logger.debug("User prompt (%d chars):\n%s", len(user_prompt), user_prompt)
-
-            # 3. Call LLM
-            llm_response = await self.llm.complete(SYSTEM_PROMPT, user_prompt)
-
-            # 4. Parse response
-            multi_decision = self._parse_response(llm_response)
-            cycle.reasoning_content = llm_response.reasoning_content
+            # Parse response
+            multi_decision = self._parse_response(response_text)
             cycle.llm_output = multi_decision
 
-            # 5. Validate each decision through risk manager
+            # Validate each decision through risk manager
             validated: list[ValidatedDecision] = []
             for decision in multi_decision.decisions:
                 price = prices.get(decision.symbol, 0)
@@ -196,19 +217,23 @@ class StrategyEngine:
 
             cycle.validated_decisions = validated
 
-            # 6. Execute approved decisions
+            # Execute approved decisions
             self._execute_decisions(validated, prices)
 
             cycle.portfolio_state_after = self.portfolio.to_summary_dict(prices)
 
         except Exception as e:
-            logger.exception("Analysis cycle failed")
+            logger.exception("Decision processing failed")
             cycle.error = str(e)
             validated = []
 
         self.cycles.append(cycle)
         if self.config.store_reasoning:
             self.portfolio.analysis_cycles.append(cycle)
+
+        # Clean up pending state
+        self._pending_reports = {}
+        self._pending_prices = {}
 
         return validated
 
@@ -336,9 +361,9 @@ class StrategyEngine:
         parts.append("\nAnalyze all symbols. Output your decisions as JSON.")
         return "\n".join(parts)
 
-    def _parse_response(self, llm_response) -> MultiSymbolDecision:
-        """Parse LLM JSON response into MultiSymbolDecision."""
-        content = llm_response.content.strip()
+    def _parse_response(self, response_text: str) -> MultiSymbolDecision:
+        """Parse raw JSON response text into MultiSymbolDecision."""
+        content = response_text.strip()
 
         # Strip markdown code fences if present
         if content.startswith("```"):
@@ -355,7 +380,7 @@ class StrategyEngine:
             if start >= 0 and end > start:
                 data = json.loads(content[start:end])
             else:
-                logger.error("Failed to parse LLM response as JSON: %s", content[:200])
+                logger.error("Failed to parse response as JSON: %s", content[:200])
                 # Return HOLD for all symbols
                 return MultiSymbolDecision(
                     decisions=[
@@ -363,8 +388,6 @@ class StrategyEngine:
                         for s in self.config.symbols
                     ],
                     raw_response=content,
-                    reasoning_content=llm_response.reasoning_content,
-                    model=llm_response.model,
                 )
 
         decisions = []
@@ -378,13 +401,11 @@ class StrategyEngine:
         seen_symbols = {d.symbol for d in decisions}
         for s in self.config.symbols:
             if s not in seen_symbols:
-                decisions.append(TradeDecision.hold(s, "No decision provided by LLM"))
+                decisions.append(TradeDecision.hold(s, "No decision provided"))
 
         return MultiSymbolDecision(
             decisions=decisions,
             raw_response=content,
-            reasoning_content=llm_response.reasoning_content,
-            model=llm_response.model,
         )
 
     def _execute_decisions(

@@ -1,6 +1,22 @@
-"""Async main loop: 3 collectors → strategy engine → risk manager → execute/log.
+"""TradingSystem: callable Python API for LLM-orchestrated trading.
 
-Run with: OPENROUTER_API_KEY=xxx python -m src.main
+Usage (from an LLM that can execute Python):
+
+    from src.main import TradingSystem
+
+    system = TradingSystem()
+    await system.start()
+
+    # Each analysis cycle:
+    prompt = system.get_prompt()
+    # Read prompt["system_prompt"] and prompt["user_prompt"], produce JSON
+    result = system.submit_decision('{"decisions": [...]}')
+
+    # Anytime:
+    system.check_stops()   # check SL/TP on open positions
+    system.get_status()    # portfolio summary
+
+    await system.stop()
 """
 
 from __future__ import annotations
@@ -8,15 +24,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import os
-import signal
-import sys
 import time
 from pathlib import Path
 
 import yaml
 
-from .adapters.openrouter_adapter import OpenRouterAdapter
 from .collector import DataCollector
 from .models.config import TradingConfig
 from .models.position import PortfolioState
@@ -26,21 +38,13 @@ logger = logging.getLogger(__name__)
 
 
 def load_config() -> TradingConfig:
-    """Load config from config.yaml, environment variables, and defaults."""
+    """Load config from config.yaml and defaults."""
     config_path = Path(__file__).parent.parent / "config.yaml"
     data = {}
     if config_path.exists():
         with open(config_path) as f:
             data = yaml.safe_load(f) or {}
-
-    config = TradingConfig(**data)
-
-    # Override API key from environment
-    api_key = os.environ.get("OPENROUTER_API_KEY", "")
-    if api_key:
-        config.openrouter.api_key = api_key
-
-    return config
+    return TradingConfig(**data)
 
 
 def setup_logging(level: str) -> None:
@@ -51,150 +55,218 @@ def setup_logging(level: str) -> None:
     )
 
 
-async def main() -> None:
-    config = load_config()
-    setup_logging(config.log_level)
+class TradingSystem:
+    """Callable trading system for LLM orchestration.
 
-    if not config.openrouter.api_key:
-        logger.error("OPENROUTER_API_KEY not set. Export it or add to config.yaml.")
-        sys.exit(1)
+    The LLM controls the cadence — call get_prompt() whenever you want
+    a new analysis, then submit_decision() with your JSON response.
+    """
 
-    logger.info("=" * 60)
-    logger.info("Orderly Network LLM Trading System")
-    logger.info("Symbols: %s", ", ".join(config.symbols))
-    logger.info("Model: %s", config.openrouter.model)
-    logger.info("Budget: $%.2f (paper=%s)", config.initial_budget, config.paper_trading)
-    logger.info("Analysis interval: %ds", config.analysis_interval_seconds)
-    logger.info("=" * 60)
+    def __init__(self) -> None:
+        self.config: TradingConfig | None = None
+        self.portfolio: PortfolioState | None = None
+        self.engine: StrategyEngine | None = None
+        self.collectors: dict[str, DataCollector] = {}
+        self._started = False
+        self._cycle_count = 0
 
-    # Account ID: only required for private WS. Public market data
-    # works with SDK's default placeholder (empty string → SDK default).
-    account_id = config.orderly_account_id
+    async def start(self, stabilization_seconds: int = 10) -> str:
+        """Load config, start WebSocket collectors, wait for data.
 
-    # Initialize portfolio
-    portfolio = PortfolioState(
-        initial_budget=config.initial_budget,
-        current_budget=config.initial_budget,
-        peak_budget=config.initial_budget,
-    )
+        Returns a status message describing what was started.
+        """
+        self.config = load_config()
+        setup_logging(self.config.log_level)
 
-    # Initialize LLM adapter
-    llm = OpenRouterAdapter(config.openrouter)
-
-    # Initialize strategy engine
-    engine = StrategyEngine(config, llm, portfolio)
-
-    # Initialize collectors (one per symbol)
-    collectors: dict[str, DataCollector] = {}
-    for symbol in config.symbols:
-        collector = DataCollector(
-            symbol=symbol,
-            ws_account_id=account_id,
-            testnet=config.testnet,
-            rest_base_url=config.rest_base_url,
+        self.portfolio = PortfolioState(
+            initial_budget=self.config.initial_budget,
+            current_budget=self.config.initial_budget,
+            peak_budget=self.config.initial_budget,
         )
-        collectors[symbol] = collector
 
-    # Backfill historical klines (blocking, runs before WS connects)
-    logger.info("Backfilling historical klines...")
-    for symbol, collector in collectors.items():
-        collector.backfill_klines()
+        self.engine = StrategyEngine(self.config, self.portfolio)
 
-    # Start WebSocket connections
-    logger.info("Starting WebSocket connections...")
-    for collector in collectors.values():
-        collector.start()
+        account_id = self.config.orderly_account_id
 
-    # Wait for initial data to arrive
-    logger.info("Waiting 10s for WebSocket data to stabilize...")
-    await asyncio.sleep(10)
+        # Initialize collectors (one per symbol)
+        for symbol in self.config.symbols:
+            self.collectors[symbol] = DataCollector(
+                symbol=symbol,
+                ws_account_id=account_id,
+                testnet=self.config.testnet,
+                rest_base_url=self.config.rest_base_url,
+            )
 
-    # Shutdown event
-    shutdown = asyncio.Event()
+        # Backfill historical klines
+        logger.info("Backfilling historical klines...")
+        for collector in self.collectors.values():
+            collector.backfill_klines()
 
-    def handle_signal(*_):
-        logger.info("Shutdown signal received")
-        shutdown.set()
+        # Start WebSocket connections
+        logger.info("Starting WebSocket connections...")
+        for collector in self.collectors.values():
+            collector.start()
 
-    loop = asyncio.get_event_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, handle_signal)
+        # Wait for data to stabilize
+        logger.info("Waiting %ds for WebSocket data...", stabilization_seconds)
+        await asyncio.sleep(stabilization_seconds)
 
-    logger.info("Entering main trading loop...")
-    cycle_count = 0
+        self._started = True
 
-    try:
-        while not shutdown.is_set():
-            cycle_start = time.time()
-            cycle_count += 1
+        msg = (
+            f"Trading system started.\n"
+            f"Symbols: {', '.join(self.config.symbols)}\n"
+            f"Budget: ${self.config.initial_budget:.2f} "
+            f"(paper={self.config.paper_trading})\n"
+            f"Collectors active: {len(self.collectors)}"
+        )
+        logger.info(msg)
+        return msg
 
-            try:
-                # 1. Get current prices
-                prices: dict[str, float] = {}
-                for symbol, collector in collectors.items():
-                    prices[symbol] = collector.current_price
-
-                # Log prices
-                price_str = " | ".join(
-                    f"{s}: ${p:.2f}" for s, p in prices.items() if p > 0
-                )
-                logger.info("Cycle %d — Prices: %s", cycle_count, price_str)
-
-                # 2. Check SL/TP on all open positions
-                close_messages = engine.check_stop_loss_take_profit(prices)
-                for msg in close_messages:
-                    logger.info("SL/TP: %s", msg)
-
-                # 3. Get snapshots from all collectors
-                snapshots = {
-                    symbol: collector.get_snapshot()
-                    for symbol, collector in collectors.items()
-                }
-
-                # 4. Run analysis cycle (indicators → LLM → validate → execute)
-                validated = await engine.run_cycle(snapshots, prices)
-
-                # 5. Log summary
-                approved = sum(1 for v in validated if v.approved and v.original.action.value not in ("HOLD",))
-                rejected = sum(1 for v in validated if not v.approved and v.original.action.value not in ("HOLD",))
-                logger.info(
-                    "Cycle %d complete — Approved: %d, Rejected: %d, "
-                    "Budget: $%.2f, Open positions: %d",
-                    cycle_count, approved, rejected,
-                    portfolio.current_budget, len(portfolio.open_positions),
-                )
-
-                # 6. Save reasoning to file
-                if config.store_reasoning and engine.cycles:
-                    _save_cycle_log(engine.cycles[-1], cycle_count)
-
-            except Exception:
-                logger.exception("Error in cycle %d", cycle_count)
-
-            # Wait for next cycle
-            elapsed = time.time() - cycle_start
-            sleep_time = max(0, config.analysis_interval_seconds - elapsed)
-            logger.info("Next cycle in %.0fs...", sleep_time)
-
-            try:
-                await asyncio.wait_for(shutdown.wait(), timeout=sleep_time)
-            except asyncio.TimeoutError:
-                pass
-
-    finally:
-        logger.info("Shutting down...")
-        for collector in collectors.values():
+    async def stop(self) -> str:
+        """Shut down collectors and return final summary."""
+        for collector in self.collectors.values():
             collector.stop()
-        await llm.close()
+        self._started = False
 
-        # Final summary
-        logger.info("=" * 60)
-        logger.info("Final Portfolio Summary")
-        logger.info("Budget: $%.2f (started: $%.2f)", portfolio.current_budget, portfolio.initial_budget)
-        logger.info("Total trades: %d (Win rate: %.1f%%)", portfolio.total_trades, portfolio.win_rate * 100)
-        logger.info("Peak budget: $%.2f", portfolio.peak_budget)
-        logger.info("Analysis cycles: %d", cycle_count)
-        logger.info("=" * 60)
+        summary = self.get_status()
+        logger.info("Trading system stopped.")
+        logger.info(
+            "Final — Budget: $%.2f, Trades: %d, Win rate: %.1f%%",
+            summary.get("current_budget", 0),
+            summary.get("total_trades", 0),
+            summary.get("win_rate", 0) * 100,
+        )
+        return summary
+
+    def get_prompt(self) -> dict:
+        """Get current market analysis prompt for the LLM.
+
+        Returns dict with:
+            - system_prompt: trading instructions and rules
+            - user_prompt: current market data, indicators, portfolio state
+            - sl_tp_events: list of SL/TP close messages (if any triggered)
+        """
+        if not self._started:
+            raise RuntimeError("System not started. Call start() first.")
+
+        # Get current prices
+        prices: dict[str, float] = {}
+        for symbol, collector in self.collectors.items():
+            prices[symbol] = collector.current_price
+
+        # Check SL/TP before analysis
+        close_messages = self.engine.check_stop_loss_take_profit(prices)
+        for msg in close_messages:
+            logger.info("SL/TP: %s", msg)
+
+        # Get snapshots from all collectors
+        snapshots = {
+            symbol: collector.get_snapshot()
+            for symbol, collector in self.collectors.items()
+        }
+
+        # Build prompts (computes indicators internally)
+        system_prompt, user_prompt = self.engine.prepare_analysis(snapshots, prices)
+
+        price_str = " | ".join(
+            f"{s}: ${p:.2f}" for s, p in prices.items() if p > 0
+        )
+        logger.info("Prompt generated — Prices: %s", price_str)
+
+        return {
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
+            "sl_tp_events": close_messages,
+        }
+
+    def submit_decision(self, response_json: str) -> dict:
+        """Submit the LLM's JSON decision for validation and execution.
+
+        Args:
+            response_json: Raw JSON string with trading decisions.
+
+        Returns:
+            Dict with cycle number, approved/rejected counts, per-decision
+            details, and current portfolio status.
+        """
+        if not self._started:
+            raise RuntimeError("System not started. Call start() first.")
+
+        self._cycle_count += 1
+        validated = self.engine.process_response(response_json)
+
+        approved = sum(
+            1 for v in validated
+            if v.approved and v.original.action.value not in ("HOLD",)
+        )
+        rejected = sum(
+            1 for v in validated
+            if not v.approved and v.original.action.value not in ("HOLD",)
+        )
+
+        # Save cycle log
+        if self.config.store_reasoning and self.engine.cycles:
+            _save_cycle_log(self.engine.cycles[-1], self._cycle_count)
+
+        result = {
+            "cycle": self._cycle_count,
+            "approved_trades": approved,
+            "rejected_trades": rejected,
+            "decisions": [
+                {
+                    "symbol": v.original.symbol,
+                    "action": v.original.action.value,
+                    "approved": v.approved,
+                    "leverage": v.final_leverage,
+                    "quantity": v.final_quantity,
+                    "rejection_reasons": v.rejection_reasons,
+                }
+                for v in validated
+            ],
+            "portfolio": self.get_status(),
+        }
+
+        logger.info(
+            "Cycle %d — Approved: %d, Rejected: %d",
+            self._cycle_count, approved, rejected,
+        )
+
+        return result
+
+    def check_stops(self) -> list[str]:
+        """Check SL/TP on all open positions.
+
+        Returns list of close event messages (empty if nothing triggered).
+        """
+        if not self._started:
+            raise RuntimeError("System not started. Call start() first.")
+
+        prices = {
+            symbol: collector.current_price
+            for symbol, collector in self.collectors.items()
+        }
+        messages = self.engine.check_stop_loss_take_profit(prices)
+        for msg in messages:
+            logger.info("SL/TP: %s", msg)
+        return messages
+
+    def get_status(self) -> dict:
+        """Get current portfolio and system status."""
+        if not self.portfolio:
+            return {"error": "System not initialized"}
+
+        prices = {}
+        if self._started:
+            prices = {
+                symbol: collector.current_price
+                for symbol, collector in self.collectors.items()
+            }
+
+        summary = self.portfolio.to_summary_dict(prices)
+        summary["cycles_completed"] = self._cycle_count
+        summary["system_running"] = self._started
+        return summary
 
 
 def _save_cycle_log(cycle, cycle_num: int) -> None:
@@ -206,7 +278,6 @@ def _save_cycle_log(cycle, cycle_num: int) -> None:
     record = {
         "cycle": cycle_num,
         "timestamp": cycle.timestamp,
-        "reasoning_content": cycle.reasoning_content[:5000] if cycle.reasoning_content else "",
         "decisions": [
             {
                 "symbol": v.original.symbol,
@@ -226,7 +297,3 @@ def _save_cycle_log(cycle, cycle_num: int) -> None:
 
     with open(log_file, "a") as f:
         f.write(json.dumps(record, default=str) + "\n")
-
-
-if __name__ == "__main__":
-    asyncio.run(main())

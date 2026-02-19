@@ -5,16 +5,6 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 
-class OpenRouterConfig(BaseModel):
-    api_key: str = ""  # Set via OPENROUTER_API_KEY env var
-    base_url: str = "https://openrouter.ai/api/v1"
-    model: str = "x-ai/grok-3-mini"
-    reasoning_effort: str = "high"
-    max_tokens: int = 4096
-    temperature: float = 0.2
-    timeout: float = 60.0
-
-
 class ReserveThresholds(BaseModel):
     """Graduated reserve system thresholds."""
 
@@ -80,11 +70,9 @@ class TradingConfig(BaseModel):
         "PERP_BTC_USDC",
         "PERP_SOL_USDC",
     ]
-    analysis_interval_seconds: int = 300  # 5 minutes
     initial_budget: float = 1000.0
     paper_trading: bool = True
 
-    openrouter: OpenRouterConfig = Field(default_factory=OpenRouterConfig)
     risk: RiskConfig = Field(default_factory=RiskConfig)
     leverage_scale: LeverageScale = Field(default_factory=LeverageScale)
 
