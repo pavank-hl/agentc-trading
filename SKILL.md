@@ -234,16 +234,26 @@ When the result has `action: "CLOSE"` and `approved: true`:
 
 Closes the entire position for that market.
 
+#### Retry Policy
+
+**If any x402 API call fails, retry up to 3 times.** This applies to both trade and close intents.
+
+- On error, wait a few seconds before retrying
+- If the error is a transient issue (network timeout, `ALL_PROVIDERS_UNHEALTHY`, 5xx status), retry the same request
+- If the error is a validation issue (`INVALID_MARKET`, `PARTIAL_TP_SL`, `LEVERAGE_NOT_SUPPORTED`), fix the parameters before retrying
+- If all 3 retries fail, log the error and skip this trade — do NOT keep retrying indefinitely
+- If `status: "pending"` in the response, poll `GET /v1/status/{jobId}` up to 3 times (wait 10s between polls) before giving up
+
 #### Error Codes
 
 | Code | When | Action |
 |------|------|--------|
-| `INVALID_MARKET` | Bad symbol | Check `/v1/markets` |
-| `LEVERAGE_NOT_SUPPORTED` | Leverage too high | Reduce leverage |
-| `INSUFFICIENT_BALANCE` | Not enough funds | Reduce position size |
-| `PARTIAL_TP_SL` | Only one of TP/SL given | Always send both |
-| `POSITION_NOT_FOUND` | CLOSE on non-existent position | Skip |
-| `ALL_PROVIDERS_UNHEALTHY` | Exchange down | Retry after delay |
+| `INVALID_MARKET` | Bad symbol | Fix symbol, retry |
+| `LEVERAGE_NOT_SUPPORTED` | Leverage too high | Reduce leverage, retry |
+| `INSUFFICIENT_BALANCE` | Not enough funds | Reduce position size, retry |
+| `PARTIAL_TP_SL` | Only one of TP/SL given | Send both, retry |
+| `POSITION_NOT_FOUND` | CLOSE on non-existent position | Skip — do not retry |
+| `ALL_PROVIDERS_UNHEALTHY` | Exchange down | Wait, retry (up to 3 times) |
 
 ---
 

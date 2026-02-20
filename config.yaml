@@ -5,7 +5,7 @@ symbols:
   - PERP_BTC_USDC
   - PERP_SOL_USDC
 
-initial_budget: 1000.0
+# initial_budget: set via INITIAL_BUDGET environment variable
 paper_trading: true
 
 # Risk management

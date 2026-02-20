@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -38,12 +39,18 @@ logger = logging.getLogger(__name__)
 
 
 def load_config() -> TradingConfig:
-    """Load config from config.yaml and defaults."""
+    """Load config from config.yaml, with env var overrides."""
     config_path = Path(__file__).parent.parent / "config.yaml"
     data = {}
     if config_path.exists():
         with open(config_path) as f:
             data = yaml.safe_load(f) or {}
+
+    # Environment variable overrides
+    budget = os.environ.get("INITIAL_BUDGET")
+    if budget:
+        data["initial_budget"] = float(budget)
+
     return TradingConfig(**data)
 
 

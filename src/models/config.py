@@ -70,7 +70,7 @@ class TradingConfig(BaseModel):
         "PERP_BTC_USDC",
         "PERP_SOL_USDC",
     ]
-    initial_budget: float = 1000.0
+    initial_budget: float  # Set via INITIAL_BUDGET env var
     paper_trading: bool = True
 
     risk: RiskConfig = Field(default_factory=RiskConfig)
