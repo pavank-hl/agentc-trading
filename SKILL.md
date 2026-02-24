@@ -163,7 +163,7 @@ result = system.submit_decision(response_json)
 
 **Decision fields:**
 - `action`: `LONG`, `SHORT`, `HOLD`, or `CLOSE`
-- `leverage`: 1-10 (will be capped by risk manager based on confidence)
+- `leverage`: Choose based on conviction and market (max leverage varies per market)
 - `quantity`: Position size in base asset. Use: `(budget * 0.02) / (entry_price * sl_distance_pct)`
 - `stop_loss` / `take_profit`: Absolute prices. SL should be 1-2 ATR away. TP at 2:1+ risk/reward
 - `confidence`: 0.0-1.0
@@ -452,27 +452,16 @@ summary = await system.stop()
 
 You don't need to worry about these — the risk manager validates every decision automatically. But here's what it checks:
 
-**9-layer validation on every decision:**
+**8-layer validation on every decision:**
 
 1. **Drawdown circuit breaker** — halts trading at 20% drawdown from peak, reduces size at 10%
 2. **Confidence validation** — rejects below 0.1
-3. **Leverage cap** — scales max leverage to confidence (0.4 confidence → max 2x, even if you say 10x)
-4. **Budget zone access** — graduated reserve: Free (70%), Guarded (20%, requires proven win rate), Floor (5%, exceptional only), Lockout (5%, never touched)
-5. **Stop-loss validation** — must exist, correct direction, 0.5-3.0x ATR range
-6. **Risk/reward ratio** — minimum 1.5:1
-7. **Position sizing** — max 2% loss per trade
-8. **Total exposure** — cumulative margin across all symbols capped at 80%
-9. **Position conflicts** — rejects duplicate positions on same symbol
-
-**Leverage scaling by confidence:**
-
-| Confidence | Max Leverage |
-|------------|-------------|
-| 0.0 - 0.3 | 1x |
-| 0.3 - 0.5 | 2x |
-| 0.5 - 0.7 | 5x |
-| 0.7 - 0.85 | 7x |
-| 0.85 - 1.0 | 10x |
+3. **Budget zone access** — graduated reserve: Free (70%), Guarded (20%, requires proven win rate), Floor (5%, exceptional only), Lockout (5%, never touched)
+4. **Stop-loss validation** — must exist, correct direction, 0.5-3.0x ATR range
+5. **Risk/reward ratio** — minimum 1.5:1
+6. **Position sizing** — max 2% loss per trade
+7. **Total exposure** — cumulative margin across all symbols capped at 80%
+8. **Position conflicts** — rejects duplicate positions on same symbol
 
 ---
 
