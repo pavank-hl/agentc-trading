@@ -17,6 +17,30 @@ Once started, run analysis cycles on your own cadence (recommended: every 5 minu
 
 ---
 
+## ⛔ MINIMUM ORDER VALUE: amount × leverage MUST BE ≥ $10.50 ⛔
+
+**THIS IS THE #1 CAUSE OF FAILED TRADES. READ THIS CAREFULLY.**
+
+Before you send ANY trade to the API, compute: `amount × leverage`. If the result is less than $10.50, the order WILL be rejected by Orderly Network. You will have wasted gas fees and x402 payment for nothing.
+
+**BAD example (WILL FAIL):**
+```
+amount: 0.4, leverage: 5 → 0.4 × 5 = $2.00 ← REJECTED. $2.00 < $10.50
+amount: 2, leverage: 3 → 2 × 3 = $6.00 ← REJECTED. $6.00 < $10.50
+amount: 1, leverage: 5 → 1 × 5 = $5.00 ← REJECTED. $5.00 < $10.50
+```
+
+**GOOD example (WILL SUCCEED):**
+```
+amount: 3, leverage: 5 → 3 × 5 = $15.00 ← OK. $15.00 ≥ $10.50
+amount: 5, leverage: 3 → 5 × 3 = $15.00 ← OK. $15.00 ≥ $10.50
+amount: 11, leverage: 1 → 11 × 1 = $11.00 ← OK. $11.00 ≥ $10.50
+```
+
+**Every single time you choose an amount and leverage, multiply them together and check ≥ $10.50 BEFORE calling the API. No exceptions.**
+
+---
+
 ## CRITICAL RULES (Read First)
 
 **Before EVERY trade, you MUST:**
@@ -174,15 +198,15 @@ result = system.submit_decision(response_json)
 
 **Before sending ANY trade request to the API, you MUST validate every single order against these rules. If any rule fails, DO NOT send the request — adjust or skip the trade.**
 
-#### Rule 1: Minimum Order Value — $10.50
+#### Rule 1: Minimum Order Value — $10.50 (MOST IMPORTANT)
 
-Every order must satisfy:
+Every order MUST satisfy:
 
 ```
 amount × leverage ≥ $10.50
 ```
 
-If `amount × leverage < $10.50`, the order is invalid. Either increase the amount or increase the leverage so the notional value meets the minimum. **Do not send the API request if this check fails.**
+**Do the math every single time.** For example: amount=0.4, leverage=5 → 0.4 × 5 = $2.00 → REJECTED. This wastes gas and x402 payment fees. You must pick an amount and leverage combination where the product is at least $10.50. If you can't meet this minimum with the available balance, do NOT place the trade at all.
 
 #### Rule 2: Balance Sufficiency
 
