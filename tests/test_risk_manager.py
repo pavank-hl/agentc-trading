@@ -1,4 +1,4 @@
-"""Tests for the risk manager's graduated reserve system and validation layers."""
+"""Tests for the risk manager's validation layers."""
 
 import pytest
 
@@ -11,7 +11,7 @@ from src.risk_manager import RiskManager
 
 @pytest.fixture
 def config() -> TradingConfig:
-    return TradingConfig(initial_budget=1000.0)
+    return TradingConfig()
 
 
 @pytest.fixture
@@ -21,7 +21,7 @@ def risk(config) -> RiskManager:
 
 @pytest.fixture
 def portfolio() -> PortfolioState:
-    return PortfolioState(initial_budget=1000.0, current_budget=1000.0, peak_budget=1000.0)
+    return PortfolioState()
 
 
 @pytest.fixture
@@ -53,60 +53,18 @@ def _make_losing_trades(n: int, symbol: str = "PERP_ETH_USDC") -> list[ClosedTra
     ]
 
 
-class TestBudgetZones:
-    def test_default_zones(self, risk, portfolio):
-        zones = risk.compute_budget_zones(portfolio)
-        # Only free zone accessible by default (0 trades)
-        assert zones.free == 700.0
-        assert zones.guarded == 200.0
-        assert zones.lockout == 50.0
-        assert zones.accessible == 700.0  # Only free zone
-
-    def test_guarded_unlocked(self, risk, portfolio):
-        # Add 20 winning trades (100% win rate)
-        portfolio.closed_trades = _make_winning_trades(20)
-        zones = risk.compute_budget_zones(portfolio)
-        # Free + guarded should be accessible
-        assert zones.accessible == 900.0
-
-    def test_guarded_locked_by_losing_streak(self, risk, portfolio):
-        # 17 wins + 3 losses = 85% win rate but on a 3-loss streak
-        portfolio.closed_trades = _make_winning_trades(17) + _make_losing_trades(3)
-        zones = risk.compute_budget_zones(portfolio)
-        # Guarded should be locked due to losing streak
-        assert zones.accessible == 700.0
-
-    def test_floor_unlocked(self, risk, portfolio):
-        # 30 trades, >60% win rate, losses first so no losing streak at end
-        portfolio.closed_trades = _make_losing_trades(5) + _make_winning_trades(25)
-        zones = risk.compute_budget_zones(portfolio)
-        # Free + guarded + floor
-        assert zones.accessible == 950.0
-
-    def test_lockout_never_accessible(self, risk, portfolio):
-        portfolio.closed_trades = _make_winning_trades(50)
-        zones = risk.compute_budget_zones(portfolio)
-        # Even with perfect record, lockout stays locked
-        assert zones.accessible == 950.0  # 700 + 200 + 50, not 1000
-
-
-class TestLeverageCap:
-    def test_low_confidence_caps_leverage(self, risk, portfolio, indicator_report):
+class TestConfidenceValidation:
+    def test_low_confidence_rejected(self, risk, portfolio, indicator_report):
         decision = TradeDecision(
             symbol="PERP_ETH_USDC", action=Action.LONG,
-            leverage=10, quantity=0.1, stop_loss=2940.0,
-            take_profit=3120.0, confidence=0.4,
+            leverage=5, quantity=0.1, stop_loss=2940.0,
+            take_profit=3120.0, confidence=0.05,
         )
         result = risk.validate_decision(decision, portfolio, indicator_report, 3000.0)
-        # Confidence 0.4 → max leverage 2
-        assert result.approved
-        assert result.adjusted_leverage == 2.0
+        assert not result.approved
+        assert any("confidence" in r.lower() for r in result.rejection_reasons)
 
-    def test_high_confidence_allows_leverage(self, risk, indicator_report):
-        # Portfolio with proven track record unlocks guarded zone, removing 3x cap
-        portfolio = PortfolioState(initial_budget=1000.0, current_budget=1000.0, peak_budget=1000.0)
-        portfolio.closed_trades = _make_winning_trades(20)
-
+    def test_leverage_passed_through(self, risk, portfolio, indicator_report):
         decision = TradeDecision(
             symbol="PERP_ETH_USDC", action=Action.LONG,
             leverage=5, quantity=0.05, stop_loss=2940.0,
@@ -114,7 +72,7 @@ class TestLeverageCap:
         )
         result = risk.validate_decision(decision, portfolio, indicator_report, 3000.0)
         assert result.approved
-        assert result.adjusted_leverage == 5.0  # Confidence 0.75 (>= guarded threshold) allows up to 7x
+        assert result.adjusted_leverage == 5.0
 
 
 class TestStopLossValidation:
@@ -146,7 +104,7 @@ class TestStopLossValidation:
         assert not result.approved
 
     def test_sl_too_tight_rejected(self, risk, portfolio, indicator_report):
-        # SL 5 away, ATR is 30 → 0.17x ATR (< 0.5x minimum)
+        # SL 5 away, ATR is 30 -> 0.17x ATR (< 0.5x minimum)
         decision = TradeDecision(
             symbol="PERP_ETH_USDC", action=Action.LONG,
             leverage=5, quantity=0.1, stop_loss=2995.0,
@@ -157,33 +115,17 @@ class TestStopLossValidation:
         assert any("tight" in r.lower() for r in result.rejection_reasons)
 
 
-class TestDrawdownCircuitBreaker:
-    def test_halt_at_20pct_drawdown(self, risk, indicator_report):
-        portfolio = PortfolioState(
-            initial_budget=1000.0, current_budget=790.0, peak_budget=1000.0
-        )
+class TestRiskReward:
+    def test_bad_rr_rejected(self, risk, portfolio, indicator_report):
+        # SL 60 away, TP 30 away -> R:R 0.5 (below 1.5 minimum)
         decision = TradeDecision(
             symbol="PERP_ETH_USDC", action=Action.LONG,
             leverage=5, quantity=0.1, stop_loss=2940.0,
-            take_profit=3120.0, confidence=0.8,
+            take_profit=3030.0, confidence=0.6,
         )
         result = risk.validate_decision(decision, portfolio, indicator_report, 3000.0)
         assert not result.approved
-        assert any("HALTED" in r for r in result.rejection_reasons)
-
-    def test_size_reduced_at_10pct_drawdown(self, risk, indicator_report):
-        portfolio = PortfolioState(
-            initial_budget=1000.0, current_budget=895.0, peak_budget=1000.0
-        )
-        decision = TradeDecision(
-            symbol="PERP_ETH_USDC", action=Action.LONG,
-            leverage=2, quantity=1.0, stop_loss=2940.0,
-            take_profit=3120.0, confidence=0.6,
-        )
-        result = risk.validate_decision(decision, portfolio, indicator_report, 3000.0)
-        # Should be approved but with reduced quantity
-        assert result.approved
-        assert any("halved" in r.lower() for r in result.rejection_reasons)
+        assert any("r:r" in r.lower() for r in result.rejection_reasons)
 
 
 class TestHoldAndClose:
@@ -200,29 +142,7 @@ class TestHoldAndClose:
         assert result.approved
 
 
-class TestExposureLimits:
-    def test_total_exposure_cap(self, risk, indicator_report):
-        portfolio = PortfolioState(
-            initial_budget=1000.0, current_budget=1000.0, peak_budget=1000.0
-        )
-        # Add existing position using 750 in margin
-        portfolio.open_positions.append(
-            Position(
-                symbol="PERP_BTC_USDC", side=Action.LONG,
-                entry_price=60000, quantity=0.1, leverage=5,
-                stop_loss=59000, take_profit=62000, margin=750.0,
-            )
-        )
-        decision = TradeDecision(
-            symbol="PERP_ETH_USDC", action=Action.LONG,
-            leverage=5, quantity=0.5, stop_loss=2940.0,
-            take_profit=3120.0, confidence=0.6,
-        )
-        result = risk.validate_decision(decision, portfolio, indicator_report, 3000.0)
-        # Should be capped by total exposure limit (80% of 1000 = 800, already using 750)
-        if result.approved:
-            assert result.margin_required <= 50.0  # Only 50 left under exposure cap
-
+class TestPositionConflicts:
     def test_duplicate_position_rejected(self, risk, portfolio, indicator_report):
         portfolio.open_positions.append(
             Position(
@@ -239,3 +159,20 @@ class TestExposureLimits:
         result = risk.validate_decision(decision, portfolio, indicator_report, 3000.0)
         assert not result.approved
         assert any("already" in r.lower() for r in result.rejection_reasons)
+
+    def test_opposite_position_rejected(self, risk, portfolio, indicator_report):
+        portfolio.open_positions.append(
+            Position(
+                symbol="PERP_ETH_USDC", side=Action.LONG,
+                entry_price=2900, quantity=0.1, leverage=5,
+                stop_loss=2850, take_profit=3000, margin=60.0,
+            )
+        )
+        decision = TradeDecision(
+            symbol="PERP_ETH_USDC", action=Action.SHORT,
+            leverage=5, quantity=0.1, stop_loss=3060.0,
+            take_profit=2880.0, confidence=0.6,
+        )
+        result = risk.validate_decision(decision, portfolio, indicator_report, 3000.0)
+        assert not result.approved
+        assert any("opposite" in r.lower() for r in result.rejection_reasons)

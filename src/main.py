@@ -47,9 +47,9 @@ def load_config() -> TradingConfig:
             data = yaml.safe_load(f) or {}
 
     # Environment variable overrides
-    budget = os.environ.get("INITIAL_BUDGET")
-    if budget:
-        data["initial_budget"] = float(budget)
+    leverage_pct = os.environ.get("LEVERAGE_PCT")
+    if leverage_pct:
+        data["leverage_pct"] = int(leverage_pct)
 
     return TradingConfig(**data)
 
@@ -85,11 +85,7 @@ class TradingSystem:
         self.config = load_config()
         setup_logging(self.config.log_level)
 
-        self.portfolio = PortfolioState(
-            initial_budget=self.config.initial_budget,
-            current_budget=self.config.initial_budget,
-            peak_budget=self.config.initial_budget,
-        )
+        self.portfolio = PortfolioState()
 
         self.engine = StrategyEngine(self.config, self.portfolio)
 
@@ -123,7 +119,7 @@ class TradingSystem:
         msg = (
             f"Trading system started.\n"
             f"Symbols: {', '.join(self.config.symbols)}\n"
-            f"Budget: ${self.config.initial_budget:.2f} "
+            f"Leverage PCT: {self.config.leverage_pct}% "
             f"(paper={self.config.paper_trading})\n"
             f"Collectors active: {len(self.collectors)}"
         )
@@ -139,8 +135,7 @@ class TradingSystem:
         summary = self.get_status()
         logger.info("Trading system stopped.")
         logger.info(
-            "Final — Budget: $%.2f, Trades: %d, Win rate: %.1f%%",
-            summary.get("current_budget", 0),
+            "Final — Trades: %d, Win rate: %.1f%%",
             summary.get("total_trades", 0),
             summary.get("win_rate", 0) * 100,
         )

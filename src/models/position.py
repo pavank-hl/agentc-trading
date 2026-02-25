@@ -85,10 +85,6 @@ class ClosedTrade:
 class PortfolioState:
     """Full portfolio across all symbols."""
 
-    initial_budget: float = 1000.0
-    current_budget: float = 1000.0
-    peak_budget: float = 1000.0
-
     open_positions: list[Position] = field(default_factory=list)
     closed_trades: list[ClosedTrade] = field(default_factory=list)
 
@@ -98,10 +94,6 @@ class PortfolioState:
     @property
     def total_margin_in_use(self) -> float:
         return sum(p.margin for p in self.open_positions)
-
-    @property
-    def available_budget(self) -> float:
-        return self.current_budget - self.total_margin_in_use
 
     def total_unrealized_pnl(self, prices: dict[str, float]) -> float:
         return sum(
@@ -140,17 +132,6 @@ class PortfolioState:
                 break
         return streak
 
-    @property
-    def drawdown_from_peak(self) -> float:
-        """Current drawdown as a fraction (0.0 = at peak, 0.2 = 20% down)."""
-        if self.peak_budget == 0:
-            return 0.0
-        return (self.peak_budget - self.current_budget) / self.peak_budget
-
-    def update_peak(self) -> None:
-        if self.current_budget > self.peak_budget:
-            self.peak_budget = self.current_budget
-
     def close_position(
         self, position: Position, exit_price: float, reason: str
     ) -> ClosedTrade:
@@ -172,15 +153,11 @@ class PortfolioState:
             close_reason=reason,
         )
 
-        # current_budget tracks equity — only adjust by realized PnL
-        self.current_budget += pnl
         self.closed_trades.append(trade)
         self.open_positions.remove(position)
-        self.update_peak()
         return trade
 
     def open_position(self, position: Position) -> None:
-        # current_budget tracks equity — margin is tracked via open_positions
         self.open_positions.append(position)
 
     def get_positions_for_symbol(self, symbol: str) -> list[Position]:
@@ -189,15 +166,11 @@ class PortfolioState:
     def to_summary_dict(self, prices: dict[str, float] | None = None) -> dict:
         prices = prices or {}
         return {
-            "initial_budget": self.initial_budget,
-            "current_budget": round(self.current_budget, 2),
-            "available_budget": round(self.available_budget, 2),
             "margin_in_use": round(self.total_margin_in_use, 2),
             "unrealized_pnl": round(self.total_unrealized_pnl(prices), 2),
             "total_trades": self.total_trades,
             "win_rate": round(self.win_rate, 3),
             "losing_streak": self.losing_streak,
-            "drawdown_from_peak": round(self.drawdown_from_peak, 3),
             "open_positions": [
                 {
                     "symbol": p.symbol,

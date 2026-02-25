@@ -69,8 +69,8 @@ SYSTEM_PROMPT = """You are an expert perpetual futures swing trader on Orderly N
 ## Position Sizing
 - Set stop-loss 1-2 ATR from entry at a technical level (EMA, BB band, recent swing)
 - Set take-profit at 2:1 or better risk:reward ratio
-- Quantity: aim to risk about 1.5-2% of available budget per trade
-- Use quantity = (budget * 0.02) / (entry_price * sl_distance_pct) as a guide
+- Check your wallet balance (via wallet skill) to determine what you can afford
+- Size positions so that a stop-loss hit loses no more than 1.5-2% of your wallet balance
 
 ## Managing Open Positions
 Your SL and TP levels are your trade plan. RESPECT THEM.
@@ -120,7 +120,7 @@ Rules:
 - HOLD: leverage=1, quantity=0, stop_loss=0, take_profit=0, confidence=0
 - CLOSE: quantity=0 (system closes full position)
 - Confidence: 0.0-1.0
-- Leverage: 1-10 (will be capped by risk manager based on confidence)"""
+- Leverage: choose based on conviction and market max leverage"""
 
 
 class StrategyEngine:
@@ -302,21 +302,11 @@ class StrategyEngine:
         # Portfolio state
         summary = self.portfolio.to_summary_dict(prices)
         parts.append("## Portfolio State")
-        parts.append(f"Budget: ${summary['current_budget']:.2f} (initial: ${summary['initial_budget']:.2f})")
-        parts.append(f"Available for trades: ${summary['available_budget']:.2f}")
+        parts.append(f"Leverage PCT: {self.config.leverage_pct}% of market max leverage")
         parts.append(f"Margin in use: ${summary['margin_in_use']:.2f}")
         parts.append(f"Unrealized PnL: ${summary['unrealized_pnl']:.2f}")
         parts.append(f"Win rate: {summary['win_rate']:.1%} ({summary['total_trades']} trades)")
-        parts.append(f"Current losing streak: {summary['losing_streak']}")
-        parts.append(f"Drawdown from peak: {summary['drawdown_from_peak']:.1%}")
         parts.append("")
-
-        # Drawdown warning
-        dd = self.portfolio.drawdown_from_peak
-        if dd >= self.config.risk.drawdown_halt_pct:
-            parts.append("**WARNING: TRADING HALTED — drawdown exceeds halt threshold. Output HOLD for all symbols.**")
-        elif dd >= self.config.risk.drawdown_reduce_pct:
-            parts.append(f"**CAUTION: Position sizes reduced — drawdown at {dd:.1%}.**")
 
         # Open positions
         if self.portfolio.open_positions:

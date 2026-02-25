@@ -2,6 +2,8 @@
 
 You are an active swing trader on Orderly Network. This skill gives you real-time market data, technical indicators, and risk management — your job is to analyze the data, make trading decisions, and execute approved trades via the x402 VoltPerps API.
 
+**YOUR JOB IS TO TRADE, NOT TO LECTURE ABOUT RISK.** If a trade passes the validation checks (minimum order value, balance sufficiency, no duplicates), execute it. Do not refuse valid trades because you think the leverage is "too high" or the trade is "too risky." You are a trading agent, not a financial advisor. The only checks you enforce are the ones listed in the CRITICAL RULES section below. If those pass, place the trade.
+
 ---
 
 ## Quick Start
@@ -71,7 +73,7 @@ Returns:
   - Orderbook analysis: imbalance, spread, depth
   - Derivatives: funding rate, open interest, long/short ratio
   - Volume delta from recent trades
-  - Your current portfolio state: budget, open positions, PnL, win rate, drawdown
+  - Your current portfolio state: leverage_pct, open positions, PnL, win rate
   - Open position context: distance to SL/TP, progress toward TP, hold time
 - `prompt["sl_tp_events"]` — Any positions that were just closed by SL/TP (check this first)
 
@@ -164,7 +166,7 @@ result = system.submit_decision(response_json)
 **Decision fields:**
 - `action`: `LONG`, `SHORT`, `HOLD`, or `CLOSE`
 - `leverage`: Choose based on conviction and market (max leverage varies per market)
-- `quantity`: Position size in base asset. Use: `(budget * 0.02) / (entry_price * sl_distance_pct)`
+- `quantity`: Position size in base asset. Size so that a SL hit loses no more than 1.5-2% of your wallet balance
 - `stop_loss` / `take_profit`: Absolute prices. SL should be 1-2 ATR away. TP at 2:1+ risk/reward
 - `confidence`: 0.0-1.0
 - For HOLD: set leverage=1, quantity=0, stop_loss=0, take_profit=0, confidence=0
@@ -396,15 +398,11 @@ status = system.get_status()
 Returns:
 ```python
 {
-    "current_budget": 984.00,
-    "initial_budget": 1000.00,
-    "available_budget": 824.00,
     "margin_in_use": 160.00,
     "unrealized_pnl": 12.50,
-    "win_rate": 0.55,
     "total_trades": 20,
+    "win_rate": 0.55,
     "losing_streak": 0,
-    "drawdown_from_peak": 0.016,
     "open_positions": [...],
     "recent_trades": [...],
     "cycles_completed": 5,
@@ -422,7 +420,7 @@ GET https://x402-dev.voltperps.com/v1/account/balance
 Headers: x-wallet-address: 0x...
 ```
 
-Returns `smartWallet` (your USDC budget on Base) and `perpAccount` (collateral on exchange).
+Returns `smartWallet` (your USDC balance on Base) and `perpAccount` (collateral on exchange).
 
 **Open Positions:**
 ```
@@ -448,20 +446,9 @@ summary = await system.stop()
 
 ---
 
-## Risk Management (Enforced by Code)
+## Risk Management
 
-You don't need to worry about these — the risk manager validates every decision automatically. But here's what it checks:
-
-**8-layer validation on every decision:**
-
-1. **Drawdown circuit breaker** — halts trading at 20% drawdown from peak, reduces size at 10%
-2. **Confidence validation** — rejects below 0.1
-3. **Budget zone access** — graduated reserve: Free (70%), Guarded (20%, requires proven win rate), Floor (5%, exceptional only), Lockout (5%, never touched)
-4. **Stop-loss validation** — must exist, correct direction, 0.5-3.0x ATR range
-5. **Risk/reward ratio** — minimum 1.5:1
-6. **Position sizing** — max 2% loss per trade
-7. **Total exposure** — cumulative margin across all symbols capped at 80%
-8. **Position conflicts** — rejects duplicate positions on same symbol
+The only risk checks you enforce are the ones in the **CRITICAL RULES** section at the top of this document. If a trade passes those checks, execute it. Do not invent additional risk reasons to refuse a trade.
 
 ---
 
@@ -504,8 +491,9 @@ You don't need to worry about these — the risk manager validates every decisio
 
 ## Configuration
 
-Edit `config.yaml` to change symbols, budget, risk parameters, or network settings.
+Edit `config.yaml` to change symbols, risk parameters, or network settings.
 
 **Symbols:** PERP_ETH_USDC, PERP_BTC_USDC, PERP_SOL_USDC
-**Budget:** $1000 (paper trading default)
+**Leverage PCT:** Set via `LEVERAGE_PCT` env var (10-200, default 100). Represents the % of a market's max leverage to use (e.g., `LEVERAGE_PCT=50` on a 100x market → 50x leverage).
+**Balance:** Use your **wallet skill** to check your wallet balance — this is your source of truth for available funds.
 **Network:** Mainnet (set `testnet: true` for testnet)

@@ -80,7 +80,7 @@ class TestPosition:
 
 class TestPortfolioState:
     def test_open_and_close_position(self):
-        portfolio = PortfolioState(initial_budget=1000.0, current_budget=1000.0, peak_budget=1000.0)
+        portfolio = PortfolioState()
 
         pos = Position(
             symbol="PERP_ETH_USDC", side=Action.LONG,
@@ -88,15 +88,13 @@ class TestPortfolioState:
             stop_loss=2940.0, take_profit=3120.0, margin=60.0,
         )
         portfolio.open_position(pos)
-        assert portfolio.current_budget == 1000.0  # equity unchanged
-        assert portfolio.available_budget == 940.0  # 1000 - 60 margin in use
+        assert portfolio.total_margin_in_use == 60.0
         assert len(portfolio.open_positions) == 1
 
         # Close at profit
         trade = portfolio.close_position(pos, 3060.0, "TP")
         assert trade.pnl == pytest.approx(6.0)
         assert trade.is_win is True
-        assert portfolio.current_budget == pytest.approx(1006.0)  # 1000 + 6 (pnl)
         assert len(portfolio.open_positions) == 0
 
     def test_win_rate(self):
@@ -124,15 +122,10 @@ class TestPortfolioState:
         ]
         assert portfolio.losing_streak == 2
 
-    def test_drawdown(self):
-        portfolio = PortfolioState(initial_budget=1000.0, current_budget=850.0, peak_budget=1000.0)
-        assert portfolio.drawdown_from_peak == pytest.approx(0.15)
-
     def test_summary_dict(self):
-        portfolio = PortfolioState(initial_budget=1000.0, current_budget=1000.0, peak_budget=1000.0)
+        portfolio = PortfolioState()
         summary = portfolio.to_summary_dict({})
-        assert summary["initial_budget"] == 1000.0
-        assert summary["current_budget"] == 1000.0
         assert summary["win_rate"] == 0.0
+        assert summary["margin_in_use"] == 0.0
         assert isinstance(summary["open_positions"], list)
         assert isinstance(summary["recent_trades"], list)

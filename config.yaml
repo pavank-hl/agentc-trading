@@ -5,7 +5,7 @@ symbols:
   - PERP_BTC_USDC
   - PERP_SOL_USDC
 
-# initial_budget: set via INITIAL_BUDGET environment variable
+# leverage_pct: set via LEVERAGE_PCT environment variable (10-200, default 100)
 paper_trading: true
 
 # Risk management
@@ -14,24 +14,6 @@ risk:
   max_total_exposure_pct: 0.80
   min_sl_atr_multiple: 0.5
   max_sl_atr_multiple: 3.0
-  drawdown_reduce_pct: 0.10  # Reduce at 10% drawdown
-  drawdown_halt_pct: 0.20    # Halt at 20% drawdown
-
-  reserve:
-    free_pct: 0.70
-    guarded_pct: 0.20
-    guarded_win_rate: 0.45
-    guarded_min_trades: 20
-    guarded_max_losing_streak: 3
-    guarded_min_confidence: 0.75
-    guarded_min_rr: 2.0
-    guarded_max_leverage: 3.0
-    floor_pct: 0.05
-    floor_win_rate: 0.60
-    floor_min_trades: 30
-    floor_min_confidence: 0.9
-    floor_min_rr: 3.0
-    lockout_pct: 0.05
 
 # Network (mainnet)
 testnet: false
