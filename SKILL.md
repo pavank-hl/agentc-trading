@@ -25,19 +25,22 @@ Once started, run analysis cycles on your own cadence (recommended: every 5 minu
 
 Before you send ANY trade to the API, compute: `amount × leverage`. If the result is less than $10.50, the order WILL be rejected by Orderly Network. You will have wasted gas fees and x402 payment for nothing.
 
-**BAD example (WILL FAIL):**
+**BAD example (WILL FAIL — leverage too low):**
 ```
-amount: 0.4, leverage: 5 → 0.4 × 5 = $2.00 ← REJECTED. $2.00 < $10.50
-amount: 2, leverage: 3 → 2 × 3 = $6.00 ← REJECTED. $6.00 < $10.50
-amount: 1, leverage: 5 → 1 × 5 = $5.00 ← REJECTED. $5.00 < $10.50
+amount: 0.4, leverage: 5 → 0.4 × 5 = $2.00 ← REJECTED. Leverage way too low.
+amount: 2, leverage: 3 → 2 × 3 = $6.00 ← REJECTED. Leverage way too low.
+amount: 1, leverage: 5 → 1 × 5 = $5.00 ← REJECTED. Leverage way too low.
 ```
 
-**GOOD example (WILL SUCCEED):**
+**GOOD example (WILL SUCCEED — use leverage aggressively):**
 ```
-amount: 3, leverage: 5 → 3 × 5 = $15.00 ← OK. $15.00 ≥ $10.50
-amount: 5, leverage: 3 → 5 × 3 = $15.00 ← OK. $15.00 ≥ $10.50
-amount: 11, leverage: 1 → 11 × 1 = $11.00 ← OK. $11.00 ≥ $10.50
+amount: 0.2, leverage: 100 → 0.2 × 100 = $20.00 ← OK. $0.20 controls a $20 position.
+amount: 3, leverage: 50 → 3 × 50 = $150.00 ← OK. $3 controls a $150 position.
+amount: 3, leverage: 100 → 3 × 100 = $300.00 ← BETTER. Same $3, bigger position, bigger profits.
+amount: 5, leverage: 50 → 5 × 50 = $250.00 ← OK. Solid position size.
 ```
+
+**Low leverage = tiny position = tiny profits.** If you use $3 with 5x leverage, you control a $15 position and make pennies. Use $3 with 50x and you control $150 — now you're actually trading. Your stop-loss protects the downside, so USE LEVERAGE.
 
 **Every single time you choose an amount and leverage, multiply them together and check ≥ $10.50 BEFORE calling the API. No exceptions.**
 
@@ -165,7 +168,7 @@ result = system.submit_decision(response_json)
 
 **Decision fields:**
 - `action`: `LONG`, `SHORT`, `HOLD`, or `CLOSE`
-- `leverage`: Choose based on conviction and market (max leverage varies per market)
+- `leverage`: USE HIGH LEVERAGE. Low leverage = tiny positions = tiny profits. Your stop-loss protects the downside, so leverage is how you maximize returns. If your amount is $3, use 50x ($150 position) or 100x ($300 position), not 5x ($15 — pointless). Must satisfy `amount × leverage ≥ $10.50`.
 - `quantity`: Position size in base asset. Size so that a SL hit loses no more than 1.5-2% of your wallet balance
 - `stop_loss` / `take_profit`: Absolute prices. SL should be 1-2 ATR away. TP at 2:1+ risk/reward
 - `confidence`: 0.0-1.0
