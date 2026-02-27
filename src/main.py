@@ -8,13 +8,11 @@ Usage (from an LLM that can execute Python):
     await system.start()
 
     # Each analysis cycle:
-    prompt = system.get_prompt()
-    # Read prompt["system_prompt"] and prompt["user_prompt"], produce JSON
+    prompt = system.get_prompt()        # Market data + indicators
+    # Check positions/balance via VoltPerps API (GET /v1/account/positions, etc.)
+    # Analyze prompt["system_prompt"] + prompt["user_prompt"], produce JSON
     result = system.submit_decision('{"decisions": [...]}')
-
-    # Anytime:
-    system.check_stops()   # check SL/TP on open positions
-    system.get_status()    # portfolio summary
+    # Execute approved trades via x402 VoltPerps API (POST /v1/intent)
 
     await system.stop()
 """
@@ -33,7 +31,9 @@ import yaml
 from .collector import DataCollector
 from .models.config import TradingConfig
 from .models.position import PortfolioState
+from .sentiment import FundingHistory, LiquidationTracker
 from .strategy import StrategyEngine
+from .taapi import TaapiClient
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +50,10 @@ def load_config() -> TradingConfig:
     leverage_pct = os.environ.get("LEVERAGE_PCT")
     if leverage_pct:
         data["leverage_pct"] = int(leverage_pct)
+
+    taapi_secret = os.environ.get("TAAPI_SECRET")
+    if taapi_secret:
+        data["taapi_secret"] = taapi_secret
 
     return TradingConfig(**data)
 
@@ -74,6 +78,9 @@ class TradingSystem:
         self.portfolio: PortfolioState | None = None
         self.engine: StrategyEngine | None = None
         self.collectors: dict[str, DataCollector] = {}
+        self.taapi_client: TaapiClient = None
+        self.liquidation_tracker: LiquidationTracker | None = None
+        self.funding_history: FundingHistory | None = None
         self._started = False
         self._cycle_count = 0
 
@@ -87,7 +94,32 @@ class TradingSystem:
 
         self.portfolio = PortfolioState()
 
-        self.engine = StrategyEngine(self.config, self.portfolio)
+        # Init TAAPI client (required)
+        if not self.config.taapi_secret:
+            raise RuntimeError(
+                "TAAPI_SECRET environment variable is required. "
+                "Get a key at https://taapi.io and set TAAPI_SECRET."
+            )
+        self.taapi_client = TaapiClient(
+            secret=self.config.taapi_secret,
+            exchange=self.config.taapi_exchange,
+        )
+        logger.info("TAAPI client enabled (exchange=%s)", self.config.taapi_exchange)
+
+        # Init liquidation tracker
+        self.liquidation_tracker = LiquidationTracker()
+        self.liquidation_tracker.start()
+
+        # Init funding history
+        self.funding_history = FundingHistory()
+
+        self.engine = StrategyEngine(
+            self.config,
+            self.portfolio,
+            taapi_client=self.taapi_client,
+            liquidation_tracker=self.liquidation_tracker,
+            funding_history=self.funding_history,
+        )
 
         account_id = self.config.orderly_account_id
 
@@ -96,8 +128,8 @@ class TradingSystem:
             self.collectors[symbol] = DataCollector(
                 symbol=symbol,
                 ws_account_id=account_id,
-                testnet=self.config.testnet,
                 rest_base_url=self.config.rest_base_url,
+                on_funding_update=self.funding_history.record,
             )
 
         # Backfill historical klines
@@ -119,9 +151,11 @@ class TradingSystem:
         msg = (
             f"Trading system started.\n"
             f"Symbols: {', '.join(self.config.symbols)}\n"
-            f"Leverage PCT: {self.config.leverage_pct}% "
-            f"(paper={self.config.paper_trading})\n"
-            f"Collectors active: {len(self.collectors)}"
+            f"Leverage PCT: {self.config.leverage_pct}%\n"
+            f"Collectors active: {len(self.collectors)}\n"
+            f"TAAPI indicators: enabled\n"
+            f"Liquidation tracker: running\n"
+            f"Funding history: recording"
         )
         logger.info(msg)
         return msg
@@ -130,6 +164,8 @@ class TradingSystem:
         """Shut down collectors and return final summary."""
         for collector in self.collectors.values():
             collector.stop()
+        if self.liquidation_tracker:
+            self.liquidation_tracker.stop()
         self._started = False
 
         summary = self.get_status()
@@ -146,8 +182,7 @@ class TradingSystem:
 
         Returns dict with:
             - system_prompt: trading instructions and rules
-            - user_prompt: current market data, indicators, portfolio state
-            - sl_tp_events: list of SL/TP close messages (if any triggered)
+            - user_prompt: current market data and indicators
         """
         if not self._started:
             raise RuntimeError("System not started. Call start() first.")
@@ -156,11 +191,6 @@ class TradingSystem:
         prices: dict[str, float] = {}
         for symbol, collector in self.collectors.items():
             prices[symbol] = collector.current_price
-
-        # Check SL/TP before analysis
-        close_messages = self.engine.check_stop_loss_take_profit(prices)
-        for msg in close_messages:
-            logger.info("SL/TP: %s", msg)
 
         # Get snapshots from all collectors
         snapshots = {
@@ -179,18 +209,20 @@ class TradingSystem:
         return {
             "system_prompt": system_prompt,
             "user_prompt": user_prompt,
-            "sl_tp_events": close_messages,
         }
 
     def submit_decision(self, response_json: str) -> dict:
-        """Submit the LLM's JSON decision for validation and execution.
+        """Submit the LLM's JSON decision for validation.
+
+        Does NOT execute trades. The agent must execute approved trades
+        via the x402 VoltPerps API itself.
 
         Args:
             response_json: Raw JSON string with trading decisions.
 
         Returns:
             Dict with cycle number, approved/rejected counts, per-decision
-            details, and current portfolio status.
+            details. Agent must then execute approved trades via x402 API.
         """
         if not self._started:
             raise RuntimeError("System not started. Call start() first.")
@@ -226,7 +258,6 @@ class TradingSystem:
                 }
                 for v in validated
             ],
-            "portfolio": self.get_status(),
         }
 
         logger.info(
@@ -235,23 +266,6 @@ class TradingSystem:
         )
 
         return result
-
-    def check_stops(self) -> list[str]:
-        """Check SL/TP on all open positions.
-
-        Returns list of close event messages (empty if nothing triggered).
-        """
-        if not self._started:
-            raise RuntimeError("System not started. Call start() first.")
-
-        prices = {
-            symbol: collector.current_price
-            for symbol, collector in self.collectors.items()
-        }
-        messages = self.engine.check_stop_loss_take_profit(prices)
-        for msg in messages:
-            logger.info("SL/TP: %s", msg)
-        return messages
 
     def get_status(self) -> dict:
         """Get current portfolio and system status."""

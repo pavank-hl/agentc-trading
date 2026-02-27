@@ -10,7 +10,7 @@ from .decision import Action
 
 @dataclass
 class Position:
-    """An open position (paper or live)."""
+    """An open position."""
 
     symbol: str
     side: Action  # LONG or SHORT

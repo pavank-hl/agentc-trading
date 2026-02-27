@@ -73,13 +73,11 @@ system = TradingSystem()
 await system.start()           # Connects WebSockets, backfills kline data
 
 # Each analysis cycle:
-prompt = system.get_prompt()   # Returns {system_prompt, user_prompt, sl_tp_events}
-# LLM reads the prompt, analyzes, produces JSON decision
+prompt = system.get_prompt()   # Returns {system_prompt, user_prompt}
+# Check positions/balance via VoltPerps API (GET /v1/account/positions, etc.)
+# Analyze, produce JSON decision
 result = system.submit_decision('{"decisions": [...]}')
-
-# Anytime:
-system.check_stops()           # Check SL/TP on open positions
-system.get_status()            # Portfolio summary
+# Execute approved trades via x402 VoltPerps API (POST /v1/intent)
 
 await system.stop()            # Shutdown
 ```
@@ -96,16 +94,13 @@ symbols:
   - PERP_BTC_USDC
   - PERP_SOL_USDC
 
-initial_budget: 1000.0
-paper_trading: true
-
 risk:
   max_loss_per_trade_pct: 0.02
   max_total_exposure_pct: 0.80
-  drawdown_reduce_pct: 0.10
-  drawdown_halt_pct: 0.20
+  min_sl_atr_multiple: 0.5
+  max_sl_atr_multiple: 3.0
 
-testnet: false
+rest_base_url: https://api-evm.orderly.org
 orderly_account_id: "your_orderly_account_id_here"
 
 log_level: INFO

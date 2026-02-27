@@ -215,6 +215,15 @@ class TimeframeIndicators:
     consecutive_green: int = 0  # consecutive bullish candles from latest
     candle_trend: str = ""  # "dropping", "rising", "choppy"
 
+    # TAAPI indicators (populated from TAAPI bulk API)
+    stoch_rsi_k: float = 0.0
+    stoch_rsi_d: float = 0.0
+    adx: float = 0.0
+    cci: float = 0.0
+    obv: float = 0.0
+    taker_buy_pct: float = 50.0
+    taker_sell_pct: float = 50.0
+
 
 @dataclass
 class OrderbookAnalysis:
@@ -226,6 +235,7 @@ class OrderbookAnalysis:
     spread_bps: float = 0.0
     mid_price: float = 0.0
     interpretation: str = ""  # "buy_pressure", "sell_pressure", "balanced"
+    estimated_slippage_bps: float = 0.0
 
 
 @dataclass
@@ -239,6 +249,15 @@ class DerivativesAnalysis:
     short_ratio: float = 0.5
     ls_ratio: float = 1.0
     sentiment: str = ""  # "crowded_longs", "crowded_shorts", "balanced"
+
+    # Funding history (populated externally from FundingHistory)
+    funding_avg_24h: float = 0.0
+    funding_trend: str = "flat"  # "rising", "falling", "flat"
+
+    # Liquidation data (populated externally from LiquidationTracker)
+    long_liq_volume: float = 0.0
+    short_liq_volume: float = 0.0
+    liq_bias: str = "balanced"  # "long_squeeze", "short_squeeze", "balanced"
 
 
 @dataclass
@@ -257,6 +276,9 @@ class IndicatorReport:
 
     ticker_change_24h: float = 0.0
     ticker_volume_24h: float = 0.0
+
+    spot_futures_basis_pct: float = 0.0
+    fear_greed_index: int = 50
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +394,22 @@ def _analyze_orderbook(snapshot: MarketSnapshot) -> OrderbookAnalysis:
         analysis.interpretation = "sell_pressure"
     else:
         analysis.interpretation = "balanced"
+
+    # Estimate slippage from orderbook depth
+    # Slippage = how far a $1000 market order would move through the book
+    if ob.asks and bbo.mid_price > 0:
+        cumulative_qty = 0.0
+        target_usd = 1000.0
+        worst_price = bbo.ask_price if bbo.ask_price > 0 else bbo.mid_price
+        for level in ob.asks:
+            level_usd = level.quantity * level.price
+            cumulative_qty += level_usd
+            worst_price = level.price
+            if cumulative_qty >= target_usd:
+                break
+        slippage = (worst_price - bbo.mid_price) / bbo.mid_price * 10_000
+        analysis.estimated_slippage_bps = max(0.0, slippage)
+
     return analysis
 
 
@@ -434,5 +472,11 @@ def compute_indicators(snapshot: MarketSnapshot) -> IndicatorReport:
     # Ticker
     report.ticker_change_24h = snapshot.ticker.change_24h
     report.ticker_volume_24h = snapshot.ticker.volume_24h
+
+    # Spot-futures basis
+    if snapshot.index_price > 0:
+        report.spot_futures_basis_pct = (
+            (snapshot.mark_price - snapshot.index_price) / snapshot.index_price * 100
+        )
 
     return report

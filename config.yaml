@@ -6,7 +6,7 @@ symbols:
   - PERP_SOL_USDC
 
 # leverage_pct: set via LEVERAGE_PCT environment variable (10-200, default 100)
-paper_trading: true
+# taapi_secret: set via TAAPI_SECRET env var (REQUIRED — StochRSI, ADX, CCI, OBV, taker flow)
 
 # Risk management
 risk:
@@ -15,8 +15,7 @@ risk:
   min_sl_atr_multiple: 0.5
   max_sl_atr_multiple: 3.0
 
-# Network (mainnet)
-testnet: false
+# Network
 rest_base_url: https://api-evm.orderly.org
 orderly_account_id: "0xf98092b3dbe8f67ffa7171e520e97b7d506efb5d3106c93a9c63a86688cd62bc"
 

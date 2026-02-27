@@ -1,8 +1,20 @@
 # Orderly Perpetual Futures Trading Skill
 
-You are an active swing trader on Orderly Network. This skill gives you real-time market data, technical indicators, and risk management — your job is to analyze the data, make trading decisions, and execute approved trades via the x402 VoltPerps API.
+You are an active swing trader on Orderly Network. This skill gives you real-time market data, technical indicators, and risk management — your job is to analyze the data, make trading decisions, and execute trades via the x402 VoltPerps API.
 
-**YOUR JOB IS TO TRADE, NOT TO LECTURE ABOUT RISK.** If a trade passes the validation checks (minimum order value, balance sufficiency, no duplicates), execute it. Do not refuse valid trades because you think the leverage is "too high" or the trade is "too risky." You are a trading agent, not a financial advisor. The only checks you enforce are the ones listed in the CRITICAL RULES section below. If those pass, place the trade.
+**YOUR JOB IS TO TRADE, NOT TO LECTURE ABOUT RISK.** If a trade passes the validation checks (minimum order value, balance sufficiency, no duplicates), execute it. Do not refuse valid trades because you think the leverage is "too high" or the trade is "too risky." You are a trading agent, not a financial advisor.
+
+---
+
+## NEVER ASSUME — ALWAYS VERIFY VIA API
+
+**You have ZERO in-memory state about positions, orders, or balances.** Every single time you need to know:
+- What positions are open → call `GET /v1/account/positions`
+- What orders exist → call `GET /v1/account/orders`
+- What balance is available → call `GET /v1/account/balance` (or wallet skill)
+- What a position's PnL is → call `GET /v1/account/positions`
+
+**NEVER say "I have a position open" without first calling the API.** NEVER assume a trade went through without verifying via the orders/positions endpoint. NEVER cache or remember position data from a previous cycle — always fetch fresh.
 
 ---
 
@@ -27,40 +39,45 @@ Before you send ANY trade to the API, compute: `amount × leverage`. If the resu
 
 **BAD example (WILL FAIL — leverage too low):**
 ```
-amount: 0.4, leverage: 5 → 0.4 × 5 = $2.00 ← REJECTED. Leverage way too low.
-amount: 2, leverage: 3 → 2 × 3 = $6.00 ← REJECTED. Leverage way too low.
-amount: 1, leverage: 5 → 1 × 5 = $5.00 ← REJECTED. Leverage way too low.
+amount: 0.4, leverage: 5 → 0.4 × 5 = $2.00 ← REJECTED.
+amount: 2, leverage: 3 → 2 × 3 = $6.00 ← REJECTED.
 ```
 
-**GOOD example (WILL SUCCEED — use leverage aggressively):**
+**GOOD example (WILL SUCCEED):**
 ```
-amount: 0.2, leverage: 100 → 0.2 × 100 = $20.00 ← OK. $0.20 controls a $20 position.
-amount: 3, leverage: 50 → 3 × 50 = $150.00 ← OK. $3 controls a $150 position.
-amount: 3, leverage: 100 → 3 × 100 = $300.00 ← BETTER. Same $3, bigger position, bigger profits.
-amount: 5, leverage: 50 → 5 × 50 = $250.00 ← OK. Solid position size.
+amount: 0.2, leverage: 100 → 0.2 × 100 = $20.00 ← OK.
+amount: 3, leverage: 50 → 3 × 50 = $150.00 ← OK.
+amount: 3, leverage: 100 → 3 × 100 = $300.00 ← BETTER.
 ```
-
-**Low leverage = tiny position = tiny profits.** If you use $3 with 5x leverage, you control a $15 position and make pennies. Use $3 with 50x and you control $150 — now you're actually trading. Your stop-loss protects the downside, so USE LEVERAGE.
 
 **Every single time you choose an amount and leverage, multiply them together and check ≥ $10.50 BEFORE calling the API. No exceptions.**
 
 ---
 
-## CRITICAL RULES (Read First)
+## The 5-Minute Trading Loop
 
-**Before EVERY trade, you MUST:**
-1. **Check your wallet balance** (use your **wallet skill**) — never trade blind
-2. **Check your open positions** (`GET /v1/account/positions`) — know what's already running
-3. **Check your pending/open orders** (`GET /v1/account/orders`) — don't send a new trade if one is already in flight
-4. **Validate minimum order value**: `amount × leverage ≥ $10.50` — orders below this will fail
-5. **Validate balance sufficiency**: `amount ≤ wallet_balance` — never place a trade you can't afford
-6. **Never open duplicate positions** on the same symbol
+```python
+# 1. Get market data + indicators (all pre-computed)
+prompt = system.get_prompt()
 
-**If you skip these checks, you will spam the API with invalid requests that get rejected. Always validate BEFORE sending. After sending a trade, confirm it via the orders endpoint — do NOT resend blindly.**
+# 2. MANDATORY: Check real positions + balance via VoltPerps API
+#    GET /v1/account/positions  → what's actually open
+#    GET /v1/account/orders     → what orders are in flight
+#    GET /v1/account/balance    → what you can actually spend
+#    (or use wallet skill for balance)
 
----
+# 3. Analyze prompt["system_prompt"] + prompt["user_prompt"], produce JSON
+response_json = '{"decisions": [...]}'
 
-## The Trading Loop
+# 4. Submit decision for validation
+result = system.submit_decision(response_json)
+
+# 5. Execute approved trades via x402 VoltPerps API (POST /v1/intent)
+
+# 6. Verify the trade went through (GET /v1/account/positions)
+
+# 7. Wait ~5 min, repeat from step 1
+```
 
 ### Step 1: Get the Analysis Prompt
 
@@ -69,63 +86,132 @@ prompt = system.get_prompt()
 ```
 
 Returns:
-- `prompt["system_prompt"]` — Your trading rules, signal categories, and output format
+- `prompt["system_prompt"]` — Trading rules, signal categories, position sizing framework, output format
 - `prompt["user_prompt"]` — Current market data for all 3 symbols (ETH, BTC, SOL) including:
-  - Technical indicators across 3 timeframes (5m, 15m, 1h): RSI, MACD, Bollinger Bands, EMA alignment, VWAP, ATR
-  - Recent price action: % change over last 3 candles, consecutive red/green streaks
-  - Orderbook analysis: imbalance, spread, depth
-  - Derivatives: funding rate, open interest, long/short ratio
-  - Volume delta from recent trades
-  - Your current portfolio state: leverage_pct, open positions, PnL, win rate
-  - Open position context: distance to SL/TP, progress toward TP, hold time
-- `prompt["sl_tp_events"]` — Any positions that were just closed by SL/TP (check this first)
+  - **Core indicators** (3 timeframes: 5m, 15m, 1h): RSI, MACD, Bollinger Bands, EMA alignment, VWAP, ATR
+  - **TAAPI indicators**: StochRSI, ADX, CCI, OBV, Taker Buy/Sell flow
+  - **Recent price action**: % change over last 3 candles, consecutive red/green streaks
+  - **Orderbook**: imbalance, spread, depth, estimated slippage
+  - **Derivatives**: funding rate, funding 24h avg + trend, OI, L/S ratio, liquidation volumes + bias
+  - **Sentiment**: Fear & Greed Index, Spot-Futures basis
+  - **Volume delta** from recent trades
 
-### Step 2: Check Your Wallet Balance and Existing Positions (MANDATORY)
+**This prompt contains ONLY market data and indicators. It does NOT contain position or balance information.** You MUST get that from the VoltPerps API (Step 2).
 
-**Before doing ANY analysis or making ANY trading decision, you MUST check your wallet balance and open positions.** This is non-negotiable — never skip this step.
+### Step 2: Check Positions, Orders, and Balance (MANDATORY — EVERY CYCLE)
 
-**Wallet balance:** Use your **wallet skill** to check your available balance. This tells you how much funds you actually have to pay for trades. This is your source of truth for whether you can afford a trade or not.
+**Before doing ANY analysis or making ANY trading decision, you MUST call these APIs.** This is non-negotiable — never skip this step. Never rely on memory from a previous cycle.
 
-**Open positions:** Check what's already running so you don't open duplicates:
+#### Get Balance
+
+Use your **wallet skill** or call the API directly:
+
+```
+GET https://x402-dev.voltperps.com/v1/account/balance
+Headers: x-wallet-address: <your wallet address>
+```
+
+Response:
+```json
+{
+  "success": true,
+  "data": {
+    "balances": {
+      "smartWallet": 25.50,
+      "perpAccount": {
+        "total": 150.00,
+        "available": 140.00,
+        "frozen": 10.00
+      }
+    }
+  }
+}
+```
+
+- `perpAccount.available` = funds you can use for new positions
+- `smartWallet` = USDC ready to claim to your EOA
+
+#### Get Open Positions
+
 ```
 GET https://x402-dev.voltperps.com/v1/account/positions
 Headers: x-wallet-address: <your wallet address>
 ```
 
-**Pending/open orders:** Check if you already have orders in flight (e.g. from a previous trade request still being processed through the x402 flow):
+Response:
+```json
+{
+  "success": true,
+  "data": {
+    "positions": [
+      {
+        "symbol": "PERP_ETH_USDC",
+        "side": "long",
+        "size": 0.5,
+        "entryPrice": 3200.00,
+        "markPrice": 3250.00,
+        "pnl": 25.00,
+        "leverage": 10,
+        "liquidationPrice": 2900.00,
+        "associatedOrders": [
+          { "orderId": 67603395, "algoType": "TAKE_PROFIT", "triggerPrice": 3520.00, "status": "INCOMPLETE" },
+          { "orderId": 67603396, "algoType": "STOP_LOSS", "triggerPrice": 3040.00, "status": "INCOMPLETE" }
+        ]
+      }
+    ]
+  }
+}
 ```
-GET https://x402-dev.voltperps.com/v1/account/orders
+
+**This is your ONLY source of truth for open positions.** The `pnl` field is the real unrealized PnL. The `associatedOrders` show your active TP/SL. If `positions` is empty, you have no open positions.
+
+#### Get a Single Position
+
+```
+GET https://x402-dev.voltperps.com/v1/account/positions/{symbol}
 Headers: x-wallet-address: <your wallet address>
 ```
 
-If there are already pending or open orders, **do not send another trade request for the same symbol.** Wait for the existing order to resolve before placing a new one.
+Use short symbol: `GET /v1/account/positions/ETH`
 
-**You must know your wallet balance BEFORE you analyze the market.** Your balance determines what you can afford, which directly shapes your decisions on position size and leverage. Do not analyze the market and then discover you can't afford the trade — check first, then decide within your means.
+Returns `"position": null` if no position exists for that market.
+
+#### Get Orders
+
+```
+GET https://x402-dev.voltperps.com/v1/account/orders?status=OPEN&symbol=ETH
+Headers: x-wallet-address: <your wallet address>
+```
+
+Query parameters (all optional): `symbol`, `status` (OPEN/FILLED/CANCELLED), `side` (BUY/SELL), `page`, `size`
+
+If there are pending or open orders for a symbol, **do not send another trade for that symbol.** Wait for the existing order to resolve.
 
 ### Step 3: Analyze and Decide
 
-Read both prompts carefully. The system prompt contains your trading rules. The user prompt contains the current market snapshot.
+Read both prompts + the real position/balance data from Step 2.
 
 Look for **confluence** — 2+ signal categories agreeing on a direction:
 
 | Signal Category | What to Check |
 |----------------|---------------|
-| **Trend** (15m, 1h) | EMA alignment (9 > 21 > 50 = bullish), Price vs VWAP, MACD direction |
-| **Momentum** (5m, 15m) | RSI (<40 long, >60 short), Bollinger %B, MACD histogram, candle streaks |
-| **Microstructure** | Orderbook imbalance, volume delta, spread |
-| **Derivatives** | Funding rate direction, OI changes, L/S ratio extremes |
+| **Trend** (15m, 1h) | EMA alignment (9 > 21 > 50 = bullish), Price vs VWAP, MACD direction, ADX (>25 = strong trend) |
+| **Momentum** (5m, 15m) | RSI (<40 long, >60 short), StochRSI (<20 oversold, >80 overbought), CCI, Bollinger %B, MACD histogram, candle streaks |
+| **Microstructure** | Orderbook imbalance, taker flow (>60% = directional), volume delta, OBV, slippage estimate |
+| **Derivatives** | Funding rate + trend, OI changes, L/S ratio, liquidation bias |
+| **Sentiment** | Fear & Greed (<25 contrarian buy, >75 contrarian sell), spot-futures basis |
 
-**Decision matrix:**
-- 2 categories agree → trade with confidence 0.4-0.6
-- 3 categories agree → trade with confidence 0.6-0.8
-- Strong trend + momentum → trade even without microstructure
-- Conflicting/flat signals → HOLD
+**Position Sizing (use this framework with your REAL balance from Step 2):**
 
-**For open positions:** Default is HOLD. Only CLOSE when the original trade thesis is broken (2+ categories flipped against you). A small unrealized loss is NOT a reason to close — that's what the stop-loss is for.
+| Setup Strength | Margin % of Wallet | Leverage | Example ($2 wallet) |
+|---------------|-------------------|----------|---------------------|
+| **STRONG** (ADX>30, 3+ categories, OBV confirms, taker flow >60%) | 60-80% | 80x-100x | $1.50 × 100x = $150 |
+| **MODERATE** (ADX 20-30, 2 categories, neutral OBV) | 30-50% | 40x-70x | $0.80 × 50x = $40 |
+| **WEAK** (ADX<20, 2 moderate categories) | 15-25% | 20x-40x | $0.50 × 25x = $12.50 |
+
+**For symbols with an existing position (from Step 2):** Default is HOLD. Only CLOSE when the original trade thesis is broken (2+ categories flipped against you). A small unrealized loss is NOT a reason to close — the exchange-side TP/SL handles that.
 
 ### Step 4: Submit Your Decision
-
-Produce a JSON string with one decision per symbol:
 
 ```python
 response_json = '''{
@@ -133,12 +219,12 @@ response_json = '''{
     {
       "symbol": "PERP_ETH_USDC",
       "action": "LONG",
-      "leverage": 5,
+      "leverage": 100,
       "quantity": 0.05,
       "stop_loss": 1960.0,
       "take_profit": 2060.0,
-      "confidence": 0.65,
-      "reasoning": "15m and 1h EMAs bullish, RSI 38, orderbook bid-heavy"
+      "confidence": 0.75,
+      "reasoning": "ADX 35, 15m+1h EMAs bullish, StochRSI oversold, taker 65% buy"
     },
     {
       "symbol": "PERP_BTC_USDC",
@@ -148,17 +234,17 @@ response_json = '''{
       "stop_loss": 0,
       "take_profit": 0,
       "confidence": 0,
-      "reasoning": "Consolidating, no clear signal"
+      "reasoning": "ADX 15 choppy, no clear signal"
     },
     {
       "symbol": "PERP_SOL_USDC",
       "action": "SHORT",
-      "leverage": 3,
+      "leverage": 50,
       "quantity": 12.5,
       "stop_loss": 155.0,
       "take_profit": 140.0,
       "confidence": 0.6,
-      "reasoning": "RSI 72, funding extreme positive, bearish divergence"
+      "reasoning": "RSI 72, StochRSI 85, funding rising, bearish divergence"
     }
   ]
 }'''
@@ -166,126 +252,80 @@ response_json = '''{
 result = system.submit_decision(response_json)
 ```
 
-**Decision fields:**
-- `action`: `LONG`, `SHORT`, `HOLD`, or `CLOSE`
-- `leverage`: USE HIGH LEVERAGE. Low leverage = tiny positions = tiny profits. Your stop-loss protects the downside, so leverage is how you maximize returns. If your amount is $3, use 50x ($150 position) or 100x ($300 position), not 5x ($15 — pointless). Must satisfy `amount × leverage ≥ $10.50`.
-- `quantity`: Position size in base asset. Size so that a SL hit loses no more than 1.5-2% of your wallet balance
-- `stop_loss` / `take_profit`: Absolute prices. SL should be 1-2 ATR away. TP at 2:1+ risk/reward
-- `confidence`: 0.0-1.0
-- For HOLD: set leverage=1, quantity=0, stop_loss=0, take_profit=0, confidence=0
-- For CLOSE: set quantity=0 (system closes full position)
-
-### Step 5: Process the Result
-
-`result` from `submit_decision()` contains:
-
+`result` contains:
 ```python
 {
     "cycle": 1,
-    "approved_trades": 1,        # How many non-HOLD trades were approved
-    "rejected_trades": 1,        # How many were rejected by risk manager
+    "approved_trades": 1,
+    "rejected_trades": 1,
     "decisions": [
         {
             "symbol": "PERP_ETH_USDC",
             "action": "LONG",
             "approved": True,
-            "leverage": 5.0,       # Final leverage (may be adjusted down)
-            "quantity": 0.04,      # Final quantity (may be adjusted down)
+            "leverage": 100.0,
+            "quantity": 0.04,
             "rejection_reasons": []
         },
         ...
-    ],
-    "portfolio": { ... }          # Current portfolio status
+    ]
 }
 ```
 
-### Step 6: Pre-Execution Validation (MANDATORY — DO NOT SKIP)
+### Step 5: Pre-Execution Validation (MANDATORY)
 
-**Before sending ANY trade request to the API, you MUST validate every single order against these rules. If any rule fails, DO NOT send the request — adjust or skip the trade.**
+Before sending ANY trade to the API:
 
-#### Rule 1: Minimum Order Value — $10.50 (MOST IMPORTANT)
+1. **Minimum order value**: `amount × leverage ≥ $10.50`
+2. **Balance sufficiency**: `amount ≤ perpAccount.available` (from Step 2)
+3. **No duplicate positions**: Check positions from Step 2 — if a position already exists for this symbol, don't open another
+4. **No duplicate orders**: Check orders from Step 2 — if an order is already in flight, don't send another
 
-Every order MUST satisfy:
+### Step 6: Execute Approved Trades via x402 VoltPerps API
 
-```
-amount × leverage ≥ $10.50
-```
+**Base URL:** `https://x402-dev.voltperps.com/v1`
 
-**Do the math every single time.** For example: amount=0.4, leverage=5 → 0.4 × 5 = $2.00 → REJECTED. This wastes gas and x402 payment fees. You must pick an amount and leverage combination where the product is at least $10.50. If you can't meet this minimum with the available balance, do NOT place the trade at all.
-
-#### Rule 2: Balance Sufficiency
-
-The `amount` (margin required for the trade) must be less than or equal to your wallet balance. Check this against the balance you fetched via your **wallet skill** in Step 2:
-
-```
-amount ≤ wallet_balance
-```
-
-If you don't have enough funds in your wallet to pay for the trade, **do not place the trade.** Reduce the amount or skip the trade entirely.
-
-#### Rule 3: No Duplicate Positions
-
-Check the open positions you fetched in Step 2. If you already have an open position on a symbol, do NOT open another position on the same symbol. The only valid actions for a symbol with an open position are HOLD or CLOSE.
-
-#### Rule 4: Total Exposure Check
-
-Sum up the margin across ALL your open positions (existing + the new trade you're about to place). This total must not exceed 80% of your total balance. If adding this trade would push you over, reduce the size or skip.
-
-**If any of these checks fail, do NOT call the API. Adjust the parameters to pass all checks, or skip the trade. Never spam the API with orders you cannot afford.**
-
-### Step 7: Execute Approved Trades via x402 VoltPerps API
-
-**When a decision is approved with action LONG or SHORT**, and it has **passed all pre-execution validation checks in Step 6**, use your **x402 skills** to invoke the x402-enabled VoltPerps API and place the real order on Orderly Network.
-
-The trade endpoint (`POST /v1/intent`) is an **x402-enabled endpoint** — it will respond with `402 Payment Required` on the first request. Use your x402 skills to handle the payment flow: your x402 skill will automatically pay the required USDC on Base and retry with the payment receipt.
-
-For each approved decision in `result["decisions"]`:
-
-```python
-if decision["approved"] and decision["action"] in ("LONG", "SHORT"):
-    # FIRST: Run all Step 6 checks (min order value, balance, duplicates, exposure)
-    # ONLY if all checks pass:
-    # Use your x402 skills to POST to the VoltPerps API
-    # The endpoint is x402-enabled — your x402 skill handles the 402 payment flow
-    # Use the FINAL leverage and quantity from the result (risk-adjusted values)
-```
+All write operations use `POST /v1/intent`. The trade endpoint is x402-enabled — it responds with `402 Payment Required` on the first request. Use your x402 skills to handle the payment flow automatically.
 
 #### Opening a Position
 
-**Endpoint:** `POST https://x402-dev.voltperps.com/v1/intent`
+```
+POST https://x402-dev.voltperps.com/v1/intent
+```
 
-This is an **x402-enabled endpoint**. Use your x402 skills to make this request — they will handle the `402 Payment Required` response, make the USDC payment on Base, and retry with the `X-PAYMENT` header automatically.
-
-**Payload:**
 ```json
 {
   "intent": "trade",
   "market": "ETH",
   "side": "long",
-  "leverage": 5,
+  "leverage": 100,
   "amount": 50,
-  "type": "market",
   "tp": 3,
   "sl": 2,
-  "userWallet": "add your wallet address here"
+  "userWallet": "0x..."
 }
 ```
 
-**Parameter mapping from your decision:**
+**Parameters:**
 
-| Decision Field | x402 Field | Conversion |
-|---------------|------------|------------|
-| `symbol` | `market` | Strip prefix/suffix: `PERP_ETH_USDC` → `ETH`, `PERP_BTC_USDC` → `BTC`, `PERP_SOL_USDC` → `SOL` |
-| `action` | `side` | `LONG` → `"long"`, `SHORT` → `"short"` |
-| `leverage` (from result) | `leverage` | Use as-is (already risk-adjusted) |
-| `quantity` (from result) | `quantity` | Position size in base asset units. Or use `amount` for USDC size instead |
-| `stop_loss` | `sl` | Convert to whole-number % from entry (see below) |
-| `take_profit` | `tp` | Convert to whole-number % from entry (see below) |
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| intent | string | Yes | Must be `"trade"` |
+| userWallet | string | Yes | Your EOA wallet address |
+| market | string | Yes | Short symbol: `ETH`, `BTC`, `SOL` |
+| side | string | Yes | `"long"` or `"short"` |
+| leverage | number | Yes | 1-50 (varies by market — check `GET /v1/markets`) |
+| amount | number | Conditional | Position size in USDC. Provide `amount` OR `quantity`, not both |
+| quantity | number | Conditional | Position size in base asset. Provide `amount` OR `quantity`, not both |
+| tp | number | No | Take-profit % from entry (0.1-50). Must pair with `sl`. Defaults to 5% if omitted |
+| sl | number | No | Stop-loss % from entry (0.1-50). Must pair with `tp`. Defaults to 3% if omitted |
+| unsafe | boolean | No | When true, no TP/SL. Cannot combine with tp/sl |
+| type | string | No | `"market"` (default) or `"limit"` |
+| price | number | Conditional | Required for limit orders only |
 
-**TP/SL conversion — absolute prices to whole-number percentages:**
+**Symbol mapping:** `PERP_ETH_USDC` → `ETH`, `PERP_BTC_USDC` → `BTC`, `PERP_SOL_USDC` → `SOL`
 
-TP and SL values must be **whole integers representing % from entry**. No decimals, no `%` symbol.
-
+**TP/SL are percentages from entry, not absolute prices.** Convert from your decision:
 ```
 For LONG:
   tp = round((take_profit_price - entry_price) / entry_price * 100)
@@ -298,10 +338,14 @@ For SHORT:
 
 Example: ETH at $2000, SL=$1960, TP=$2060 → `sl: 2`, `tp: 3`
 
-**TP/SL rules:**
-- Must provide both `tp` and `sl`, or neither
-- If neither provided and `unsafe` is false, defaults apply: `tp=5`, `sl=3`
-- Cannot combine `unsafe: true` with TP/SL
+**TP/SL behavior:**
+| `unsafe` | TP/SL provided | Result |
+|----------|---------------|--------|
+| false | Both tp + sl | Uses provided values |
+| false | Neither | Defaults: tp=5%, sl=3% |
+| false | One only | Error: `PARTIAL_TP_SL` |
+| true | Neither | No TP/SL |
+| true | Either/both | Error: `UNSAFE_WITH_TP_SL` |
 
 **Response:**
 ```json
@@ -320,156 +364,350 @@ Example: ETH at $2000, SL=$1960, TP=$2060 → `sl: 2`, `tp: 3`
 
 If `status: "pending"`, poll `GET /v1/status/{jobId}` until completed (up to 30s).
 
-#### Confirming the Order Was Placed
-
-After sending a trade request, the x402 flow (payment, swapping, deposit) can take time. **Do not spam another request for the same symbol.** Instead, confirm the order landed by querying:
-
-```
-GET https://x402-dev.voltperps.com/v1/account/orders
-Headers: x-wallet-address: <your wallet address>
-```
-
-- If the order appears as open/filled, the trade succeeded — move on.
-- If the order is not yet visible, wait and check again (up to 3 times, 10s apart).
-- If after 3 checks the order still hasn't appeared and the original API call returned success, assume it's still processing — do NOT resend the same trade request.
-
 #### Closing a Position
 
-When the result has `action: "CLOSE"` and `approved: true`:
-
-**Endpoint:** `POST https://x402-dev.voltperps.com/v1/intent` (free — no x402 payment required)
+Free — no x402 payment required.
 
 ```json
 {
   "intent": "close",
-  "market": "ETH"
+  "market": "ETH",
+  "userWallet": "0x..."
 }
 ```
 
-Closes the entire position for that market.
+**IMPORTANT:** Before closing, verify the position actually exists: `GET /v1/account/positions/ETH`. If `position` is null, there's nothing to close.
 
-#### Retry Policy
+#### Cancelling an Order
 
-**If any x402 API call fails, retry up to 3 times.** This applies to both trade and close intents.
+```json
+{
+  "intent": "cancel",
+  "market": "ETH",
+  "orderId": "67603394",
+  "userWallet": "0x..."
+}
+```
 
-- On error, wait a few seconds before retrying
-- If the error is a transient issue (network timeout, `ALL_PROVIDERS_UNHEALTHY`, 5xx status), retry the same request
-- If the error is a validation issue (`INVALID_MARKET`, `PARTIAL_TP_SL`, `LEVERAGE_NOT_SUPPORTED`), fix the parameters before retrying
-- If all 3 retries fail, log the error and skip this trade — do NOT keep retrying indefinitely
-- If `status: "pending"` in the response, poll `GET /v1/status/{jobId}` up to 3 times (wait 10s between polls) before giving up
+#### Withdrawing Funds (two steps)
 
-#### Error Codes
+**Step 1 — Withdraw from perp accounts to smart wallet:**
+```json
+{ "intent": "withdraw", "userWallet": "0x..." }
+```
+
+**Step 2 — Claim from smart wallet to EOA:**
+```json
+{ "intent": "claim", "userWallet": "0x..." }
+```
+
+### Step 7: Verify the Trade
+
+**After every trade, verify it went through.** Do NOT assume success.
+
+```
+GET https://x402-dev.voltperps.com/v1/account/positions
+Headers: x-wallet-address: <your wallet address>
+```
+
+- If the position appears → trade succeeded
+- If not yet visible → wait 10s and check again (up to 3 times)
+- If still not visible after 3 checks → assume still processing, do NOT resend
+
+You can also check the specific order:
+```
+GET https://x402-dev.voltperps.com/v1/account/orders/{orderId}
+Headers: x-wallet-address: <your wallet address>
+```
+
+### Polling Async Jobs
+
+If any intent returns `status: "pending"`:
+
+```
+GET https://x402-dev.voltperps.com/v1/status/{jobId}
+```
+
+Returns `status`: `"pending"`, `"completed"`, or `"failed"`.
+
+---
+
+## Response Structure Reference
+
+### `get_prompt()` → `dict`
+
+Returns a dict with exactly two string keys:
+
+```python
+{
+    "system_prompt": str,  # Trading rules, signal categories, sizing framework, output format
+    "user_prompt": str     # Current market data for all symbols (structured text)
+}
+```
+
+The `system_prompt` is static — same every cycle. The `user_prompt` changes every cycle with fresh market data.
+
+### `user_prompt` Structure (per symbol)
+
+The `user_prompt` is a formatted text string. It starts with a timestamp header, then repeats the following block **for each symbol** (ETH, BTC, SOL):
+
+```
+## Current Market Data — 2025-01-15 12:30 UTC
+
+### PERP_ETH_USDC
+Mark Price: 2015.32                    ← current mark price (float)
+Index Price: 2014.98                   ← spot reference price (float)
+24h Change: -1.25%                     ← 24h price change (float %)
+24h Volume: 1234567                    ← 24h trading volume (integer)
+
+**5m Timeframe:**                      ← repeats for 5m, 15m, 1h
+  Last Close: 2015.10                  ← most recent candle close
+  RSI(14): 42.3                        ← 0-100, <40 long zone, >60 short zone
+  MACD: line=-0.1234 signal=-0.0987 hist=-0.0247
+                                       ← histogram direction = momentum
+  Bollinger: upper=2030.50 mid=2015.00 lower=1999.50 %B=0.523
+                                       ← %B: <0.3 long, >0.7 short
+  EMA: 9=2016.20 21=2014.80 50=2010.50 alignment=bullish
+                                       ← "bullish"/"bearish"/"mixed"
+  VWAP: 2013.45 (price above)         ← "above"/"below"/"at"
+  ATR(14): 12.3400                     ← volatility, use for SL placement
+  Recent: -0.35% last 3 candles, 0 red / 2 green streak, trend=choppy
+                                       ← "dropping"/"rising"/"choppy"
+  StochRSI: K=18.2 D=22.5             ← K<20 oversold, K>80 overbought
+  ADX: 32.1 (strong trend)            ← >25 "strong trend", <20 "weak/choppy"
+  CCI: -115.3                          ← <-100 oversold, >+100 overbought
+  OBV: 45230                           ← rising=bullish, falling=bearish
+  Taker Flow: 62% buy / 38% sell      ← >60% buy = aggressive demand
+
+**15m Timeframe:**                     ← same fields as 5m
+  ...
+
+**1h Timeframe:**                      ← same fields as 5m
+  ...
+
+**Orderbook:** imbalance=0.152 (buy_pressure) spread=1.2bps bid_depth=450.30 ask_depth=380.10
+                                       ← imbalance: -1 to +1. >0.2 buy, <-0.2 sell
+  Est. Slippage: 2.3bps               ← <2bps deep book, >5bps thin book
+
+**Derivatives:** funding=0.000123 (longs_pay) OI=98765 L/S=1.15 (balanced)
+                                       ← funding: + = longs pay, - = shorts pay
+                                       ← L/S: >1.49 crowded_longs, <0.67 crowded_shorts
+  Funding (24h avg): 0.000045 trend=rising
+                                       ← trend: "rising"/"falling"/"flat"
+  Liquidations (15m): long=$12400 short=$3200 (short_squeeze)
+                                       ← "long_squeeze"/"short_squeeze"/"balanced"
+
+**Volume Delta:** 125.40 (ratio=0.035) ← positive = buyers aggressive
+
+**Spot-Futures Basis:** 0.032%         ← >0.1% bullish, <-0.1% bearish
+
+**Fear & Greed Index:** 28/100 (extreme fear)
+                                       ← <25 contrarian buy, >75 contrarian sell
+
+### PERP_BTC_USDC                      ← same structure repeats
+  ...
+
+### PERP_SOL_USDC                      ← same structure repeats
+  ...
+
+Analyze all symbols. Output your decisions as JSON.
+```
+
+**Notes:**
+- StochRSI/ADX/CCI/OBV/Taker Flow lines only appear when TAAPI data is populated (ADX > 0). Since TAAPI is required, these should always be present.
+- Funding 24h avg + trend only appears when funding history has data.
+- Liquidation lines only appear when there's liquidation activity (volume > 0).
+- Spot-Futures Basis only appears when non-zero.
+- Fear & Greed label: `<25 "extreme fear"`, `<40 "fear"`, `<60 "neutral"`, `<75 "greed"`, `≥75 "extreme greed"`.
+
+### `submit_decision()` Input Format
+
+You must pass a raw JSON string. The system parses it, validates each decision through the risk manager, and returns results.
+
+```json
+{
+  "decisions": [
+    {
+      "symbol": "PERP_ETH_USDC",
+      "action": "LONG",
+      "leverage": 100,
+      "quantity": 0.05,
+      "stop_loss": 1960.0,
+      "take_profit": 2060.0,
+      "confidence": 0.75,
+      "reasoning": "ADX 35, 15m+1h EMAs bullish, StochRSI oversold, taker 65% buy"
+    }
+  ]
+}
+```
+
+| Field | Type | Required | Values |
+|-------|------|----------|--------|
+| `symbol` | string | Yes | `PERP_ETH_USDC`, `PERP_BTC_USDC`, `PERP_SOL_USDC` |
+| `action` | string | Yes | `LONG`, `SHORT`, `HOLD`, `CLOSE` |
+| `leverage` | number | Yes | 1-100+ (must satisfy amount × leverage ≥ $10.50) |
+| `quantity` | number | Yes | Position size in base asset (0 for HOLD/CLOSE) |
+| `stop_loss` | number | Yes | Absolute price level (0 for HOLD) |
+| `take_profit` | number | Yes | Absolute price level (0 for HOLD) |
+| `confidence` | number | Yes | 0.0-1.0 |
+| `reasoning` | string | Yes | Brief explanation of which categories agree |
+
+**Rules:**
+- One decision per symbol. Always include all 3 symbols.
+- HOLD: `leverage=1, quantity=0, stop_loss=0, take_profit=0, confidence=0`
+- CLOSE: `quantity=0` (system closes full position), `leverage=1, stop_loss=0, take_profit=0`
+
+### `submit_decision()` → `dict`
+
+Returns a dict with validation results:
+
+```python
+{
+    "cycle": 1,                    # int — cycle number (increments each call)
+    "approved_trades": 1,          # int — number of non-HOLD trades approved
+    "rejected_trades": 1,          # int — number of non-HOLD trades rejected
+    "decisions": [                 # list — one entry per decision submitted
+        {
+            "symbol": "PERP_ETH_USDC",  # str — the symbol
+            "action": "LONG",            # str — your requested action
+            "approved": True,            # bool — True if risk manager approved
+            "leverage": 100.0,           # float — final leverage (may be adjusted)
+            "quantity": 0.04,            # float — final quantity (may be adjusted)
+            "rejection_reasons": []      # list[str] — empty if approved
+        },
+        {
+            "symbol": "PERP_BTC_USDC",
+            "action": "HOLD",
+            "approved": True,
+            "leverage": 0.0,
+            "quantity": 0.0,
+            "rejection_reasons": []
+        },
+        {
+            "symbol": "PERP_SOL_USDC",
+            "action": "SHORT",
+            "approved": False,
+            "leverage": 0.0,
+            "quantity": 0.0,
+            "rejection_reasons": ["Notional below minimum $10.50"]
+        }
+    ]
+}
+```
+
+**Key fields to check:**
+- `approved` — **only execute trades where `approved: True` and `action` is LONG/SHORT/CLOSE**. Never execute rejected trades.
+- `leverage` and `quantity` — the risk manager may adjust these down from what you requested. **Use these final values** when executing via the API, not your original values.
+- `rejection_reasons` — tells you why a trade was rejected (e.g., "Notional below minimum $10.50", "No price/indicator data"). Use this to fix the issue in the next cycle.
+- HOLD decisions are always `approved: True` with `leverage: 0.0, quantity: 0.0` — they require no action.
+
+### How to Use These Responses
+
+**After `get_prompt()`** — systematic analysis flow:
+
+1. **Read prices** (Mark, Index, 24h Change) for each symbol to get the big picture
+2. **Check Trend** (15m + 1h): EMA alignment + VWAP + MACD direction + ADX strength
+3. **Check Momentum** (5m + 15m): RSI + StochRSI + CCI + Bollinger %B + candle trend
+4. **Check Microstructure**: Orderbook imbalance + taker flow + volume delta + OBV + slippage
+5. **Check Derivatives**: Funding rate + trend + L/S ratio + liquidation bias
+6. **Check Sentiment**: Fear & Greed + spot-futures basis
+7. **Count agreeing categories** → determine setup strength → apply position sizing framework
+8. **Cross-check symbols**: Do BTC/ETH/SOL agree? Correlated moves = stronger conviction
+
+**After `submit_decision()`** — execution flow:
+
+1. Loop through `result["decisions"]`
+2. For each decision where `approved == True` and `action` in (`LONG`, `SHORT`, `CLOSE`):
+   - Use `result["decisions"][i]["leverage"]` and `result["decisions"][i]["quantity"]` (the risk-adjusted values)
+   - Convert to API format: symbol → short name, SL/TP → percentages
+   - Execute via `POST /v1/intent`
+   - Verify via `GET /v1/account/positions`
+3. For rejected decisions: read `rejection_reasons`, adjust in next cycle
+
+---
+
+## Answering User Questions
+
+When the user asks about their positions, PnL, orders, or balance, **ALWAYS fetch fresh data from the API first**. Never answer from memory.
+
+| User asks | You MUST call | Then respond with |
+|-----------|--------------|-------------------|
+| "What positions do I have?" | `GET /v1/account/positions` | Real position data from response |
+| "What's my PnL?" | `GET /v1/account/positions` | `pnl` field from each position |
+| "What's my balance?" | `GET /v1/account/balance` (or wallet skill) | Real balance data |
+| "What orders do I have?" | `GET /v1/account/orders` | Real order data from response |
+| "Am I holding ETH?" | `GET /v1/account/positions/ETH` | The actual position or "no position" |
+
+---
+
+## Error Handling
 
 | Code | When | Action |
 |------|------|--------|
 | `INVALID_MARKET` | Bad symbol | Fix symbol, retry |
-| `LEVERAGE_NOT_SUPPORTED` | Leverage too high | Reduce leverage, retry |
-| `INSUFFICIENT_BALANCE` | Not enough funds | **You should have caught this in Step 6.** Re-check balance, reduce position size, retry |
-| `PARTIAL_TP_SL` | Only one of TP/SL given | Send both, retry |
-| `POSITION_NOT_FOUND` | CLOSE on non-existent position | Skip — do not retry |
-| `ALL_PROVIDERS_UNHEALTHY` | Exchange down | Wait, retry (up to 3 times) |
+| `LEVERAGE_NOT_SUPPORTED` | Leverage too high | Check `GET /v1/markets` for max leverage, reduce, retry |
+| `LEVERAGE_EXCEEDS_POSITION_PROVIDER` | Existing position provider doesn't support leverage | Reduce leverage or close position first |
+| `INSUFFICIENT_BALANCE` | Not enough funds | Re-check balance, reduce size or skip |
+| `PARTIAL_TP_SL` | Only one of TP/SL given | Send both or neither |
+| `UNSAFE_WITH_TP_SL` | TP/SL with unsafe mode | Remove tp/sl when using unsafe: true |
+| `POSITION_NOT_FOUND` | CLOSE on non-existent position | **You should have checked first.** Skip. |
+| `ORDER_NOT_FOUND` | Cancel non-existent order | Skip |
+| `ALL_PROVIDERS_UNHEALTHY` | Exchange down | Wait 1-2 min, retry |
+| `POSITION_PROVIDER_UNHEALTHY` | Provider degraded | Wait 1-2 min, retry |
+| `NO_PROVIDERS_FOR_MARKET` | Market unsupported | Use supported market |
+| `SERVICE_UNAVAILABLE` | Queue down | Wait 5-10s, retry |
+
+**Retryable (wait and retry up to 3 times):** All 5xx errors, `SERVICE_UNAVAILABLE`, `PROVIDER_ERROR`, `ALL_PROVIDERS_UNHEALTHY`
+
+**Non-retryable (fix or skip):** `INSUFFICIENT_BALANCE`, `INVALID_PARAMS`, `PARTIAL_TP_SL`, `LEVERAGE_NOT_SUPPORTED`, `NO_PROVIDERS_FOR_MARKET`
 
 ---
 
-## Other Functions
-
-### Check Stop-Loss / Take-Profit
-
-Call this between analysis cycles to catch SL/TP triggers:
-
-```python
-events = system.check_stops()
-# Returns list of close messages, e.g.:
-# ["Closed PERP_ETH_USDC LONG @ 1960.00 (SL) PnL: $-16.00"]
-```
-
-If a stop was triggered and the position is live on-chain, use your **x402 skills** to close it:
+## Available Markets
 
 ```
-POST https://x402-dev.voltperps.com/v1/intent
+GET https://x402-dev.voltperps.com/v1/markets
 ```
+
+Returns all supported markets with max leverage. Always check this before using a leverage value.
+
 ```json
-{ "intent": "close", "market": "ETH" }
-```
-
-### Get Portfolio Status
-
-```python
-status = system.get_status()
-```
-
-Returns:
-```python
 {
-    "margin_in_use": 160.00,
-    "unrealized_pnl": 12.50,
-    "total_trades": 20,
-    "win_rate": 0.55,
-    "losing_streak": 0,
-    "open_positions": [...],
-    "recent_trades": [...],
-    "cycles_completed": 5,
-    "system_running": True
+  "success": true,
+  "data": [
+    { "name": "PERP_BTC_USDC", "maxLeverage": 50 },
+    { "name": "PERP_ETH_USDC", "maxLeverage": 50 },
+    { "name": "PERP_SOL_USDC", "maxLeverage": 20 }
+  ]
 }
 ```
-
-### Read On-Chain Account State
-
-These are free read endpoints (no x402 payment). All require `x-wallet-address` header.
-
-**Balance:**
-```
-GET https://x402-dev.voltperps.com/v1/account/balance
-Headers: x-wallet-address: 0x...
-```
-
-Returns `smartWallet` (your USDC balance on Base) and `perpAccount` (collateral on exchange).
-
-**Open Positions:**
-```
-GET https://x402-dev.voltperps.com/v1/account/positions
-Headers: x-wallet-address: 0x...
-```
-
-**Single Position:**
-```
-GET https://x402-dev.voltperps.com/v1/account/positions/ETH
-```
-
-**Orders:**
-```
-GET https://x402-dev.voltperps.com/v1/account/orders?status=OPEN&symbol=ETH
-```
-
-### Shutdown
-
-```python
-summary = await system.stop()
-```
-
----
-
-## Risk Management
-
-The only risk checks you enforce are the ones in the **CRITICAL RULES** section at the top of this document. If a trade passes those checks, execute it. Do not invent additional risk reasons to refuse a trade.
 
 ---
 
 ## Signal Reference
 
-### Indicators (pre-computed for you)
+### Indicators (ALL pre-computed in `get_prompt()`)
 
-| Indicator | Parameters | Signal |
-|-----------|-----------|--------|
-| RSI | 14-period | <40 long zone, >60 short zone, extremes (<30, >70) strong |
-| MACD | 12, 26, 9 | Crossovers, histogram direction = momentum |
-| Bollinger Bands | 20-period, 2σ | %B <0.3 long, >0.7 short |
-| EMA | 9, 21, 50 | 9>21>50 = bullish, reverse = bearish |
-| VWAP | Session | Above = bullish bias, below = bearish |
-| ATR | 14-period | Volatility for SL placement |
-| Candle trend | Last 3 candles | Consecutive red/green, % change |
-| Orderbook | Top levels | Imbalance, spread, depth |
-| Volume delta | Recent trades | Buy vs sell aggression |
+| Indicator | Source | Signal |
+|-----------|--------|--------|
+| RSI | Orderly WS | <40 long zone, >60 short zone, extremes (<30, >70) strong |
+| MACD | Orderly WS | Crossovers, histogram direction = momentum |
+| Bollinger Bands | Orderly WS | %B <0.3 long, >0.7 short |
+| EMA | Orderly WS | 9>21>50 = bullish, reverse = bearish |
+| VWAP | Orderly WS | Above = bullish bias, below = bearish |
+| ATR | Orderly WS | Volatility for SL placement |
+| Candle trend | Orderly WS | Consecutive red/green, % change |
+| **StochRSI** | TAAPI | K<20 oversold (long), K>80 overbought (short) |
+| **ADX** | TAAPI | >25 strong trend, <20 choppy |
+| **CCI** | TAAPI | <-100 oversold, >+100 overbought |
+| **OBV** | TAAPI | Rising = bullish, divergence = reversal warning |
+| **Taker Flow** | TAAPI | >60% buy = aggressive demand |
+| Orderbook | Orderly WS | Imbalance, spread, depth, est. slippage |
+| Volume delta | Orderly WS | Buy vs sell aggression |
+| **Funding trend** | Orderly WS | Rising/falling/flat funding pressure |
+| **Liquidations** | Binance WS | Long/short squeeze detection |
+| **Fear & Greed** | alternative.me | <25 contrarian buy, >75 contrarian sell |
+| **Spot-Futures Basis** | Orderly WS | >0.1% premium (bullish), <-0.1% discount (bearish) |
 
 ### Cross-Symbol Signals
 
@@ -477,26 +715,34 @@ The only risk checks you enforce are the ones in the **CRITICAL RULES** section 
 - All 3 moving same direction = stronger conviction
 - Correlated moves confirm the trend
 
-### Data Feeds (live via WebSocket)
-
-| Feed | Update Speed |
-|------|-------------|
-| K-line 5m, 15m, 1h | ~1s |
-| Orderbook | ~1s |
-| Best Bid/Offer | ~10ms |
-| Trades | Real-time |
-| 24h Ticker | ~1s |
-| Funding Rate | ~15s |
-| Open Interest | ~1-10s |
-| Mark/Index Price | ~1s |
-
 ---
 
 ## Configuration
 
-Edit `config.yaml` to change symbols, risk parameters, or network settings.
-
 **Symbols:** PERP_ETH_USDC, PERP_BTC_USDC, PERP_SOL_USDC
-**Leverage PCT:** Set via `LEVERAGE_PCT` env var (10-200, default 100). Represents the % of a market's max leverage to use (e.g., `LEVERAGE_PCT=50` on a 100x market → 50x leverage).
-**Balance:** Use your **wallet skill** to check your wallet balance — this is your source of truth for available funds.
-**Network:** Mainnet (set `testnet: true` for testnet)
+**Leverage PCT:** Set via `LEVERAGE_PCT` env var (10-200, default 100).
+**TAAPI Indicators:** `TAAPI_SECRET` env var is **required**. Provides StochRSI, ADX, CCI, OBV, and taker flow. Get a key at https://taapi.io.
+**Balance:** Always fetch from `GET /v1/account/balance` or your **wallet skill** — never cache.
+
+---
+
+## API Quick Reference
+
+| Action | Method | Endpoint | Payment |
+|--------|--------|----------|---------|
+| Get markets | GET | `/v1/markets` | No |
+| Get balance | GET | `/v1/account/balance` | No |
+| Get all positions | GET | `/v1/account/positions` | No |
+| Get one position | GET | `/v1/account/positions/{symbol}` | No |
+| Get orders | GET | `/v1/account/orders` | No |
+| Get one order | GET | `/v1/account/orders/{orderId}` | No |
+| Get order trades | GET | `/v1/account/orders/{orderId}/trades` | No |
+| Open trade | POST | `/v1/intent` | x402 |
+| Close position | POST | `/v1/intent` | Free |
+| Cancel order | POST | `/v1/intent` | Free |
+| Withdraw | POST | `/v1/intent` | Free |
+| Claim | POST | `/v1/intent` | Free |
+| Poll job status | GET | `/v1/status/{jobId}` | No |
+| Health check | GET | `/v1/health` | No |
+
+All read endpoints require `x-wallet-address` header. Base URL: `https://x402-dev.voltperps.com/v1`

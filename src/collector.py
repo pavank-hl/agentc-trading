@@ -46,13 +46,13 @@ class DataCollector:
         self,
         symbol: str,
         ws_account_id: str,
-        testnet: bool = False,
         rest_base_url: str = "https://api-evm.orderly.org",
+        on_funding_update=None,
     ) -> None:
         self.symbol = symbol
         self.ws_account_id = ws_account_id
-        self.testnet = testnet
         self.rest_base_url = rest_base_url
+        self._on_funding_update = on_funding_update  # callback(symbol, rate, timestamp)
 
         # Derive the base asset for index price (PERP_ETH_USDC → SPOT_ETH_USDC)
         parts = symbol.split("_")
@@ -86,7 +86,7 @@ class DataCollector:
         # Account ID: SDK defaults to a public placeholder if empty/None.
         # Public market data streams don't require a real account.
         kwargs = {
-            "orderly_testnet": self.testnet,
+            "orderly_testnet": False,
             "wss_id": f"trader-{self.symbol}",
             "on_message": self._on_message,
             "on_close": self._on_close,
@@ -376,11 +376,19 @@ class DataCollector:
             self._ticker.timestamp = time.time()
 
     def _handle_funding(self, data: dict) -> None:
+        ts = time.time()
+        rate = float(data.get("estFundingRate", 0))
         with self._lock:
-            self._funding.est_funding_rate = float(data.get("estFundingRate", 0))
+            self._funding.est_funding_rate = rate
             self._funding.funding_rate = float(data.get("lastFundingRate", 0))
             self._funding.next_funding_time = float(data.get("nextFundingTime", 0))
-            self._funding.timestamp = time.time()
+            self._funding.timestamp = ts
+        # Notify funding history tracker
+        if self._on_funding_update:
+            try:
+                self._on_funding_update(self.symbol, rate, ts)
+            except Exception:
+                pass
 
     def _handle_oi(self, data: dict) -> None:
         with self._lock:

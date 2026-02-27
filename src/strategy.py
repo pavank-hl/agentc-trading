@@ -8,20 +8,24 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
 
 from .indicators import IndicatorReport, compute_indicators
 from .models.config import TradingConfig
+from .sentiment import (
+    FundingHistory,
+    LiquidationTracker,
+    fetch_fear_greed,
+)
+from .taapi import TaapiClient
 from .models.decision import (
-    Action,
     AnalysisCycle,
     MultiSymbolDecision,
     TradeDecision,
     ValidatedDecision,
 )
 from .models.market import MarketSnapshot
-from .models.position import PortfolioState, Position
+from .models.position import PortfolioState
 from .risk_manager import RiskManager
 
 logger = logging.getLogger(__name__)
@@ -43,9 +47,12 @@ SYSTEM_PROMPT = """You are an expert perpetual futures swing trader on Orderly N
 - EMA alignment: 9 > 21 > 50 = bullish, reverse = bearish
 - Price vs VWAP: above = bullish, below = bearish
 - MACD direction and histogram
+- ADX: >25 = strong trend (trust signals), <20 = choppy (filter false signals, reduce confidence)
 
 ### 2. Momentum (5m and 15m)
 - RSI: <40 favors long, >60 favors short. Extremes (<30, >70) are strong signals.
+- StochRSI: <20 = oversold (long zone), >80 = overbought (short zone). More sensitive than RSI for timing entries.
+- CCI: <-100 = oversold, >+100 = overbought. Confirms momentum extremes.
 - Bollinger %B: <0.3 = long zone, >0.7 = short zone
 - MACD histogram building = momentum, fading = weakening
 - Recent candle trend: 3+ red candles = actively dropping (bearish), 3+ green = actively rising (bullish)
@@ -53,61 +60,98 @@ SYSTEM_PROMPT = """You are an expert perpetual futures swing trader on Orderly N
 
 ### 3. Market Microstructure
 - Orderbook imbalance: positive = buy pressure, negative = sell pressure
+- Taker flow: >60% buy = aggressive buying demand, >60% sell = aggressive selling. Confirms direction.
 - Volume delta: positive = buyers aggressive, negative = sellers
+- OBV (On-Balance Volume): rising OBV confirms bullish price move, falling confirms bearish. Divergence from price = reversal warning.
+- Est. slippage: >5bps = thin book, reduce size; <2bps = deep book, full size OK
 
 ### 4. Derivatives Sentiment
 - Funding rate direction and magnitude
+- Funding trend (24h): rising = increasing long pressure, falling = increasing short pressure
 - Open interest changes
 - Long/short ratio extremes = contrarian signal
+- Liquidation bias: long_squeeze = longs getting wiped (bearish cascade risk), short_squeeze = shorts getting wiped (bullish cascade). Use as confirmation for your direction.
+
+### 5. Sentiment
+- Fear & Greed Index: <25 = extreme fear (contrarian buy signal), >75 = extreme greed (contrarian sell signal). Use as tiebreaker or confirmation, not primary signal.
+- Spot-Futures Basis: >0.1% = futures premium (bullish bias), <-0.1% = futures discount (bearish bias)
 
 ## When to Trade
 - 2 categories agreeing with moderate signals → trade with confidence 0.4-0.6
 - 3 categories agreeing → trade with confidence 0.6-0.8
 - Strong trend + momentum alignment → trade even without microstructure confirmation
 - All symbols moving together in one direction → stronger conviction
+- ADX > 30 + multiple categories aligned → highest conviction setups
 
 ## CRITICAL: Minimum Order Value — amount × leverage ≥ $10.50
 **Every trade MUST satisfy: amount × leverage ≥ $10.50.** Orders below this are REJECTED by the exchange.
 
-**Leverage amplifies your position.** Higher leverage = larger position = higher profit potential. Your stop-loss limits the downside, so DO NOT be afraid of leverage. Use it.
-- BAD: amount=$0.20, leverage=5 → $1.00 ← REJECTED (leverage way too low)
-- BAD: amount=$2, leverage=3 → $6.00 ← REJECTED (leverage way too low)
-- GOOD: amount=$0.20, leverage=100 → $20.00 ← OK. $0.20 margin controls a $20 position
-- GOOD: amount=$3, leverage=50 → $150.00 ← OK. $3 margin controls a $150 position
-- GOOD: amount=$3, leverage=100 → $300.00 ← BETTER. Same $3 margin, bigger position, bigger profits
-- GOOD: amount=$5, leverage=50 → $250.00 ← OK. Solid position size
+## Position Sizing — How to Pick Amount and Leverage
 
-**Low leverage = tiny position = tiny profits.** If you have $3, using 5x gives you a $15 position — you'll make pennies. Using 50x gives you $150 — now you're actually trading. USE LEVERAGE.
+Given your wallet balance (from wallet skill), use this framework:
 
-Compute amount × leverage and verify ≥ $10.50 BEFORE outputting your decision.
+### Step 1: Assess Setup Strength (from the signals)
 
-## Position Sizing
+STRONG SETUP (use 60-80% of wallet as margin):
+- ADX > 30 (confirmed strong trend)
+- 3+ signal categories agree on direction
+- OBV confirms price direction
+- Taker flow >60% in trade direction
+- Liquidations favor your direction (e.g. shorts getting squeezed for a LONG)
+- Fear & Greed at extremes (contrarian alignment)
+
+MODERATE SETUP (use 30-50% of wallet as margin):
+- ADX 20-30
+- 2 signal categories agree
+- OBV neutral or mildly confirming
+- No major liquidation activity
+
+WEAK BUT VALID SETUP (use 15-25% of wallet as margin):
+- ADX < 20 (weak trend) but momentum signals are clear
+- 2 categories agree but signals are moderate
+- Skip if wallet is very small (can't meet $10.50 minimum)
+
+### Step 2: Pick Leverage
+
+STRONG: 80x-100x (your SL protects you, maximize the position)
+MODERATE: 40x-70x
+WEAK: 20x-40x (minimum to clear $10.50)
+
+### Step 3: Calculate and Verify
+
+amount = wallet_balance × setup_pct
+leverage = chosen leverage
+notional = amount × leverage
+
+CHECK 1: notional ≥ $10.50? If not, increase leverage.
+CHECK 2: amount ≤ wallet_balance? Must be true.
+CHECK 3: If SL hits, loss = notional × sl_distance_pct. Acceptable?
+
+### Examples with $2 wallet:
+
+STRONG setup: amount=$1.50 (75%), leverage=100x → $150 position ✓
+MODERATE setup: amount=$0.80 (40%), leverage=50x → $40 position ✓
+WEAK setup: amount=$0.50 (25%), leverage=25x → $12.50 position ✓
+
+### SL/TP Rules
 - Set stop-loss 1-2 ATR from entry at a technical level (EMA, BB band, recent swing)
 - Set take-profit at 2:1 or better risk:reward ratio
-- Check your wallet balance (via wallet skill) to determine what you can afford
-- Size positions so that a stop-loss hit loses no more than 1.5-2% of your wallet balance
 - ALWAYS verify: amount × leverage ≥ $10.50. If not, increase leverage or amount until it does.
 
 ## Managing Open Positions
-Your SL and TP levels are your trade plan. RESPECT THEM.
+**You must check real positions via GET /v1/account/positions every cycle.** Never assume a position exists from a previous cycle.
+
+The exchange handles SL/TP automatically via algo orders. Your job is to decide whether to HOLD or CLOSE based on current signals.
 
 **Default is HOLD.** Only CLOSE when the original trade thesis is BROKEN:
 - The trend that justified entry has clearly reversed (EMA alignment flipped, MACD crossed against you on 15m+)
 - Multiple signal categories that supported the entry now oppose it
-- A small unrealized loss or flat P&L is NOT a reason to close — that's normal noise
-
-**Do NOT close because:**
-- uPnL is slightly negative — that's what the stop-loss is for
-- You're "unsure" — uncertainty means HOLD, not CLOSE
-- Only 1 category weakened while others still support the trade
-- The position just opened recently and hasn't had time to work
+- A small unrealized loss or flat P&L is NOT a reason to close — the exchange TP/SL handles exits
 
 **CLOSE when:**
 - 2+ signal categories have flipped against the position direction
 - Price action shows clear reversal pattern confirmed by trend indicators
 - The reason you entered no longer exists (e.g., bullish EMA alignment is now bearish)
-
-Think of it this way: you set SL/TP for a reason. Let them do their job unless the market structure has fundamentally changed.
 
 ## Cross-Symbol
 - BTC often leads ETH and SOL
@@ -136,7 +180,7 @@ Rules:
 - HOLD: leverage=1, quantity=0, stop_loss=0, take_profit=0, confidence=0
 - CLOSE: quantity=0 (system closes full position)
 - Confidence: 0.0-1.0
-- Leverage: USE HIGH LEVERAGE. Low leverage = tiny position = tiny profits. Your stop-loss protects the downside, so leverage is how you maximize returns. With $3 and 100x you control a $300 position. With $3 and 5x you control $15 — that's pointless. Always ensure amount × leverage ≥ $10.50.
+- Leverage: USE HIGH LEVERAGE. Low leverage = tiny position = tiny profits. Your stop-loss protects the downside, so leverage is how you maximize returns. Use the sizing framework above to pick the right amount and leverage.
 - FINAL CHECK: amount × leverage ≥ $10.50. If not, increase leverage."""
 
 
@@ -147,10 +191,16 @@ class StrategyEngine:
         self,
         config: TradingConfig,
         portfolio: PortfolioState,
+        taapi_client: TaapiClient = None,
+        liquidation_tracker: LiquidationTracker | None = None,
+        funding_history: FundingHistory | None = None,
     ) -> None:
         self.config = config
         self.portfolio = portfolio
         self.risk_manager = RiskManager(config)
+        self.taapi_client = taapi_client
+        self.liquidation_tracker = liquidation_tracker
+        self.funding_history = funding_history
         self.cycles: list[AnalysisCycle] = []
         # Intermediate state between prepare_analysis and process_response
         self._pending_reports: dict[str, IndicatorReport] = {}
@@ -171,6 +221,29 @@ class StrategyEngine:
         for symbol, snap in snapshots.items():
             reports[symbol] = compute_indicators(snap)
 
+        # Enrich with TAAPI indicators (if available)
+        self._enrich_taapi(reports)
+
+        # Enrich with Fear & Greed Index
+        fear_greed = fetch_fear_greed()
+        for report in reports.values():
+            report.fear_greed_index = fear_greed
+
+        # Enrich with liquidation data
+        if self.liquidation_tracker:
+            for symbol, report in reports.items():
+                liq = self.liquidation_tracker.get_summary(symbol)
+                report.derivatives.long_liq_volume = liq.long_liq_volume
+                report.derivatives.short_liq_volume = liq.short_liq_volume
+                report.derivatives.liq_bias = liq.bias
+
+        # Enrich with funding history
+        if self.funding_history:
+            for symbol, report in reports.items():
+                stats = self.funding_history.get_stats(symbol)
+                report.derivatives.funding_avg_24h = stats.avg_24h
+                report.derivatives.funding_trend = stats.trend
+
         # Build prompt
         user_prompt = self._build_user_prompt(reports, prices)
         logger.debug("User prompt (%d chars):\n%s", len(user_prompt), user_prompt)
@@ -181,17 +254,67 @@ class StrategyEngine:
 
         return SYSTEM_PROMPT, user_prompt
 
+    def _enrich_taapi(self, reports: dict[str, IndicatorReport]) -> None:
+        """Merge TAAPI indicators into existing reports. No-op if client is None."""
+        if not self.taapi_client:
+            return
+
+        import asyncio
+
+        try:
+            # Run the async fetch in a new event loop if needed
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+
+            if loop and loop.is_running():
+                # We're inside an async context — use a thread to avoid blocking
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    taapi_data = pool.submit(
+                        lambda: asyncio.run(
+                            self.taapi_client.fetch_indicators(list(reports.keys()))
+                        )
+                    ).result(timeout=20)
+            else:
+                taapi_data = asyncio.run(
+                    self.taapi_client.fetch_indicators(list(reports.keys()))
+                )
+        except Exception:
+            logger.warning("TAAPI enrichment failed, continuing with existing indicators", exc_info=True)
+            return
+
+        for symbol, tf_data in taapi_data.items():
+            report = reports.get(symbol)
+            if not report:
+                continue
+            for tf_name, taapi_result in tf_data.items():
+                tf_indicators = report.timeframes.get(tf_name)
+                if not tf_indicators:
+                    continue
+                tf_indicators.stoch_rsi_k = taapi_result.stoch_rsi_k
+                tf_indicators.stoch_rsi_d = taapi_result.stoch_rsi_d
+                tf_indicators.adx = taapi_result.adx
+                tf_indicators.cci = taapi_result.cci
+                tf_indicators.obv = taapi_result.obv
+                tf_indicators.taker_buy_pct = taapi_result.taker_buy_pct
+                tf_indicators.taker_sell_pct = taapi_result.taker_sell_pct
+
     def process_response(
         self,
         response_text: str,
     ) -> list[ValidatedDecision]:
-        """Phase 2: Parse JSON response, validate through risk manager, execute.
+        """Phase 2: Parse JSON response and validate through risk manager.
+
+        Does NOT create in-memory positions. The agent must execute approved
+        trades via the x402 VoltPerps API itself.
 
         Args:
             response_text: Raw JSON string with trading decisions.
 
         Returns:
-            List of validated (and possibly executed) decisions.
+            List of validated decisions for the agent to execute.
         """
         reports = self._pending_reports
         prices = self._pending_prices
@@ -233,10 +356,6 @@ class StrategyEngine:
                 )
 
             cycle.validated_decisions = validated
-
-            # Execute approved decisions
-            self._execute_decisions(validated, prices)
-
             cycle.portfolio_state_after = self.portfolio.to_summary_dict(prices)
 
         except Exception as e:
@@ -253,31 +372,6 @@ class StrategyEngine:
         self._pending_prices = {}
 
         return validated
-
-    def check_stop_loss_take_profit(self, prices: dict[str, float]) -> list[str]:
-        """Check all open positions for SL/TP hits. Returns list of close messages."""
-        messages = []
-        positions_to_close = []
-
-        for pos in self.portfolio.open_positions:
-            price = prices.get(pos.symbol)
-            if price is None:
-                continue
-            if pos.should_stop_loss(price):
-                positions_to_close.append((pos, price, "SL"))
-            elif pos.should_take_profit(price):
-                positions_to_close.append((pos, price, "TP"))
-
-        for pos, price, reason in positions_to_close:
-            trade = self.portfolio.close_position(pos, price, reason)
-            msg = (
-                f"Closed {pos.symbol} {pos.side.value} @ {price:.2f} "
-                f"({reason}) PnL: ${trade.pnl:.2f}"
-            )
-            messages.append(msg)
-            logger.info(msg)
-
-        return messages
 
     def _build_user_prompt(
         self,
@@ -305,65 +399,37 @@ class StrategyEngine:
                 parts.append(f"  VWAP: {ti.vwap_value:.2f} (price {ti.price_vs_vwap})")
                 parts.append(f"  ATR(14): {ti.atr_14:.4f}")
                 parts.append(f"  Recent: {ti.recent_change_pct:+.2f}% last 3 candles, {ti.consecutive_red} red / {ti.consecutive_green} green streak, trend={ti.candle_trend}")
+                # TAAPI indicators (only show if populated)
+                if ti.adx > 0:
+                    adx_label = "strong trend" if ti.adx > 25 else "weak/choppy"
+                    parts.append(f"  StochRSI: K={ti.stoch_rsi_k:.1f} D={ti.stoch_rsi_d:.1f}")
+                    parts.append(f"  ADX: {ti.adx:.1f} ({adx_label})")
+                    parts.append(f"  CCI: {ti.cci:.1f}")
+                    parts.append(f"  OBV: {ti.obv:.0f}")
+                    parts.append(f"  Taker Flow: {ti.taker_buy_pct:.0f}% buy / {ti.taker_sell_pct:.0f}% sell")
                 parts.append("")
 
             ob = report.orderbook
             parts.append(f"**Orderbook:** imbalance={ob.imbalance:.3f} ({ob.interpretation}) spread={ob.spread_bps:.1f}bps bid_depth={ob.bid_depth:.2f} ask_depth={ob.ask_depth:.2f}")
+            if ob.estimated_slippage_bps > 0:
+                parts.append(f"  Est. Slippage: {ob.estimated_slippage_bps:.1f}bps")
 
             dv = report.derivatives
             parts.append(f"**Derivatives:** funding={dv.funding_rate:.6f} ({dv.funding_interpretation}) OI={dv.open_interest:.0f} L/S={dv.ls_ratio:.2f} ({dv.sentiment})")
+            if dv.funding_avg_24h != 0 or dv.funding_trend != "flat":
+                parts.append(f"  Funding (24h avg): {dv.funding_avg_24h:.6f} trend={dv.funding_trend}")
+            if dv.long_liq_volume > 0 or dv.short_liq_volume > 0:
+                parts.append(f"  Liquidations (15m): long=${dv.long_liq_volume:.0f} short=${dv.short_liq_volume:.0f} ({dv.liq_bias})")
 
             parts.append(f"**Volume Delta:** {report.volume_delta:.2f} (ratio={report.volume_delta_ratio:.3f})")
+
+            if report.spot_futures_basis_pct != 0:
+                parts.append(f"**Spot-Futures Basis:** {report.spot_futures_basis_pct:.3f}%")
+
+            fg = report.fear_greed_index
+            fg_label = "extreme fear" if fg < 25 else "fear" if fg < 40 else "neutral" if fg < 60 else "greed" if fg < 75 else "extreme greed"
+            parts.append(f"**Fear & Greed Index:** {fg}/100 ({fg_label})")
             parts.append("")
-
-        # Portfolio state
-        summary = self.portfolio.to_summary_dict(prices)
-        parts.append("## Portfolio State")
-        parts.append(f"Leverage PCT: {self.config.leverage_pct}% of market max leverage")
-        parts.append(f"Margin in use: ${summary['margin_in_use']:.2f}")
-        parts.append(f"Unrealized PnL: ${summary['unrealized_pnl']:.2f}")
-        parts.append(f"Win rate: {summary['win_rate']:.1%} ({summary['total_trades']} trades)")
-        parts.append("")
-
-        # Open positions
-        if self.portfolio.open_positions:
-            parts.append("\n## Open Positions")
-            parts.append("**Default action for open positions is HOLD.** Only CLOSE if the entry thesis is broken (see rules above).\n")
-            for pos in self.portfolio.open_positions:
-                price = prices.get(pos.symbol, pos.entry_price)
-                upnl = pos.unrealized_pnl(price)
-
-                # Distance to SL and TP as percentage
-                sl_dist_pct = abs(price - pos.stop_loss) / price * 100 if price > 0 else 0
-                tp_dist_pct = abs(pos.take_profit - price) / price * 100 if price > 0 else 0
-
-                # Progress toward TP (0% = at entry, 100% = at TP)
-                total_range = abs(pos.take_profit - pos.entry_price)
-                if total_range > 0:
-                    if pos.side == Action.LONG:
-                        progress = (price - pos.entry_price) / total_range * 100
-                    else:
-                        progress = (pos.entry_price - price) / total_range * 100
-                else:
-                    progress = 0
-
-                # Time held
-                held_seconds = time.time() - pos.opened_at
-                held_min = int(held_seconds / 60)
-
-                parts.append(
-                    f"- {pos.symbol} {pos.side.value} @ {pos.entry_price:.2f} "
-                    f"(qty={pos.quantity:.4f}, lev={pos.leverage:.0f}x, uPnL=${upnl:.2f})\n"
-                    f"  SL={pos.stop_loss:.2f} ({sl_dist_pct:.1f}% away) | "
-                    f"TP={pos.take_profit:.2f} ({tp_dist_pct:.1f}% away) | "
-                    f"Progress to TP: {progress:.0f}% | Held: {held_min}min"
-                )
-
-        # Recent trades
-        if summary["recent_trades"]:
-            parts.append("\n## Recent Closed Trades")
-            for t in summary["recent_trades"]:
-                parts.append(f"- {t['symbol']} {t['side']} PnL=${t['pnl']:.2f} ({t['reason']})")
 
         parts.append("\nAnalyze all symbols. Output your decisions as JSON.")
         return "\n".join(parts)
@@ -415,51 +481,3 @@ class StrategyEngine:
             raw_response=content,
         )
 
-    def _execute_decisions(
-        self,
-        validated: list[ValidatedDecision],
-        prices: dict[str, float],
-    ) -> None:
-        """Execute approved decisions (paper trading: update in-memory portfolio)."""
-        for v in validated:
-            if not v.approved:
-                continue
-
-            decision = v.original
-
-            if decision.action == Action.CLOSE:
-                # Close all positions for this symbol
-                positions = self.portfolio.get_positions_for_symbol(decision.symbol)
-                price = prices.get(decision.symbol, 0)
-                for pos in positions:
-                    trade = self.portfolio.close_position(pos, price, "LLM_CLOSE")
-                    logger.info(
-                        "Closed %s %s @ %.2f PnL=$%.2f",
-                        pos.symbol, pos.side.value, price, trade.pnl,
-                    )
-
-            elif decision.action in (Action.LONG, Action.SHORT):
-                price = prices.get(decision.symbol, 0)
-                if price <= 0:
-                    continue
-                notional = v.final_quantity * price
-                margin = notional / v.final_leverage if v.final_leverage > 0 else notional
-
-                position = Position(
-                    symbol=decision.symbol,
-                    side=decision.action,
-                    entry_price=price,
-                    quantity=v.final_quantity,
-                    leverage=v.final_leverage,
-                    stop_loss=decision.stop_loss,
-                    take_profit=decision.take_profit,
-                    margin=margin,
-                    confidence=decision.confidence,
-                    reasoning=decision.reasoning,
-                )
-                self.portfolio.open_position(position)
-                logger.info(
-                    "Opened %s %s @ %.2f qty=%.4f lev=%.1fx margin=$%.2f",
-                    decision.symbol, decision.action.value, price,
-                    v.final_quantity, v.final_leverage, margin,
-                )

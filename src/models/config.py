@@ -23,14 +23,16 @@ class TradingConfig(BaseModel):
         "PERP_SOL_USDC",
     ]
     leverage_pct: int = 100  # % of market's max leverage to use (10-200)
-    paper_trading: bool = True
 
     risk: RiskConfig = Field(default_factory=RiskConfig)
 
     # Network
-    testnet: bool = False
     rest_base_url: str = "https://api-evm.orderly.org"
     orderly_account_id: str = ""
+
+    # TAAPI
+    taapi_secret: str = ""
+    taapi_exchange: str = "binancefutures"
 
     # Logging
     log_level: str = "INFO"
