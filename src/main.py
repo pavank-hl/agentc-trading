@@ -211,6 +211,32 @@ class TradingSystem:
             "user_prompt": user_prompt,
         }
 
+    def get_position_prompt(self, analysis_json: str, positions_json: str) -> dict | None:
+        """Build position management prompt for LLM call #2.
+
+        Args:
+            analysis_json: Raw JSON from LLM call #1 (analysis result).
+            positions_json: Raw JSON from the positions API.
+                Pass the API response directly — the system unwraps it.
+
+        Returns:
+            {"system_prompt": str, "user_prompt": str} if positions exist.
+            None if no positions (use analysis directly).
+        """
+        if not self._started:
+            raise RuntimeError("System not started. Call start() first.")
+
+        result = self.engine.get_position_prompt(analysis_json, positions_json)
+        if result is None:
+            return None
+
+        system_prompt, user_prompt = result
+        logger.info("Position management prompt generated")
+        return {
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
+        }
+
     def submit_decision(self, response_json: str) -> dict:
         """Submit the LLM's JSON decision for validation.
 
@@ -232,11 +258,11 @@ class TradingSystem:
 
         approved = sum(
             1 for v in validated
-            if v.approved and v.original.action.value not in ("HOLD",)
+            if v.approved and v.original.direction.value not in ("HOLD",)
         )
         rejected = sum(
             1 for v in validated
-            if not v.approved and v.original.action.value not in ("HOLD",)
+            if not v.approved and v.original.direction.value not in ("HOLD",)
         )
 
         # Save cycle log
@@ -250,10 +276,10 @@ class TradingSystem:
             "decisions": [
                 {
                     "symbol": v.original.symbol,
-                    "action": v.original.action.value,
+                    "direction": v.original.direction.value,
                     "approved": v.approved,
                     "leverage": v.final_leverage,
-                    "quantity": v.final_quantity,
+                    "positionSize": v.final_position_size,
                     "rejection_reasons": v.rejection_reasons,
                 }
                 for v in validated
@@ -297,11 +323,11 @@ def _save_cycle_log(cycle, cycle_num: int) -> None:
         "decisions": [
             {
                 "symbol": v.original.symbol,
-                "action": v.original.action.value,
+                "direction": v.original.direction.value,
                 "confidence": v.original.confidence,
                 "approved": v.approved,
                 "adj_leverage": v.adjusted_leverage,
-                "adj_quantity": v.adjusted_quantity,
+                "adj_position_size": v.adjusted_position_size,
                 "rejection_reasons": v.rejection_reasons,
             }
             for v in cycle.validated_decisions

@@ -32,22 +32,24 @@ class RiskManager:
         """Run all validation layers on a single decision.
 
         Returns a ValidatedDecision which may be approved (possibly with
-        adjusted leverage/quantity) or rejected with reasons.
+        adjusted leverage/position size) or rejected with reasons.
         """
         result = ValidatedDecision(original=decision)
         reasons: list[str] = []
 
         # Layer 0: HOLD/CLOSE pass through (no risk check needed)
-        if decision.action in (Action.HOLD, Action.CLOSE):
+        if decision.direction in (Action.HOLD, Action.CLOSE):
             result.approved = True
             result.adjusted_leverage = decision.leverage
-            result.adjusted_quantity = decision.quantity
+            result.adjusted_position_size = decision.position_size
             return result
 
         # Layer 1: Confidence validation
-        confidence = max(0.0, min(1.0, decision.confidence))
-        if confidence < 0.1:
-            reasons.append(f"Confidence too low: {confidence}")
+        # LONG/SHORT require confidence >= 40 (quality gate for new trades)
+        # HOLD/CLOSE are already handled above in Layer 0
+        confidence = max(0, min(100, decision.confidence))
+        if confidence < 40:
+            reasons.append(f"Confidence {confidence:.0f} below 40 quality gate")
             result.rejection_reasons = reasons
             return result
 
@@ -62,11 +64,11 @@ class RiskManager:
         sl_distance = abs(current_price - decision.stop_loss)
 
         # Validate SL direction
-        if decision.action == Action.LONG and decision.stop_loss >= current_price:
+        if decision.direction == Action.LONG and decision.stop_loss >= current_price:
             reasons.append("LONG stop-loss must be below current price")
             result.rejection_reasons = reasons
             return result
-        if decision.action == Action.SHORT and decision.stop_loss <= current_price:
+        if decision.direction == Action.SHORT and decision.stop_loss <= current_price:
             reasons.append("SHORT stop-loss must be above current price")
             result.rejection_reasons = reasons
             return result
@@ -98,36 +100,29 @@ class RiskManager:
                 result.rejection_reasons = reasons
                 return result
 
-        # Layer 4: Existing position conflict
-        existing = portfolio.get_positions_for_symbol(decision.symbol)
-        for pos in existing:
-            if pos.side == decision.action:
-                reasons.append(
-                    f"Already have {pos.side.value} position on {decision.symbol}"
-                )
-                result.rejection_reasons = reasons
-                return result
-            else:
-                # Opposite direction — must CLOSE existing first
-                reasons.append(
-                    f"Have opposite {pos.side.value} position on {decision.symbol} — CLOSE it first"
-                )
-                result.rejection_reasons = reasons
-                return result
+        adjusted_position_size = decision.position_size
 
-        adjusted_quantity = decision.quantity
+        # Layer 4: Minimum order value ($10.50)
+        notional = adjusted_position_size * current_price
+        order_value = notional * adjusted_leverage if adjusted_leverage > 0 else notional
+        if order_value < 10.50:
+            reasons.append(
+                f"Order value ${order_value:.2f} below $10.50 minimum "
+                f"(size={adjusted_position_size}, price={current_price:.2f}, lev={adjusted_leverage})"
+            )
+            result.rejection_reasons = reasons
+            return result
 
         # Compute final max loss
-        max_loss = adjusted_quantity * sl_distance
+        max_loss = adjusted_position_size * sl_distance
 
         # Compute margin
-        notional = adjusted_quantity * current_price
         margin_needed = notional / adjusted_leverage if adjusted_leverage > 0 else notional
 
         # All checks passed
         result.approved = True
         result.adjusted_leverage = adjusted_leverage
-        result.adjusted_quantity = adjusted_quantity
+        result.adjusted_position_size = adjusted_position_size
         result.margin_required = margin_needed
         result.max_loss = max_loss
         result.rejection_reasons = reasons

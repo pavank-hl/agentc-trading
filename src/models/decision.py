@@ -19,29 +19,33 @@ class TradeDecision:
     """Single per-symbol decision from the LLM."""
 
     symbol: str
-    action: Action
+    direction: Action
     leverage: float = 1.0
-    quantity: float = 0.0
+    position_size: float = 0.0
     stop_loss: float = 0.0
     take_profit: float = 0.0
-    confidence: float = 0.0
-    reasoning: str = ""
+    entry_price: float = 0.0
+    confidence: float = 0  # 0-100 scale
+    risk_level: str = "MEDIUM"
+    summary: str = ""
 
     @classmethod
-    def hold(cls, symbol: str, reasoning: str = "No action") -> TradeDecision:
-        return cls(symbol=symbol, action=Action.HOLD, reasoning=reasoning)
+    def hold(cls, symbol: str, summary: str = "No action") -> TradeDecision:
+        return cls(symbol=symbol, direction=Action.HOLD, summary=summary)
 
     @classmethod
     def from_dict(cls, d: dict) -> TradeDecision:
         return cls(
             symbol=d.get("symbol", ""),
-            action=Action(d.get("action", "HOLD").upper()),
+            direction=Action(d.get("direction", d.get("action", "HOLD")).upper()),
             leverage=float(d.get("leverage", 1)),
-            quantity=float(d.get("quantity", 0)),
-            stop_loss=float(d.get("stop_loss", 0)),
-            take_profit=float(d.get("take_profit", 0)),
+            position_size=float(d.get("positionSize", d.get("position_size", d.get("quantity", 0)))),
+            stop_loss=float(d.get("stopLoss", d.get("stop_loss", 0))),
+            take_profit=float(d.get("takeProfit", d.get("take_profit", 0))),
+            entry_price=float(d.get("entryPrice", d.get("entry_price", 0))),
             confidence=float(d.get("confidence", 0)),
-            reasoning=d.get("reasoning", ""),
+            risk_level=d.get("riskLevel", d.get("risk_level", "MEDIUM")),
+            summary=d.get("summary", d.get("reasoning", "")),
         )
 
 
@@ -63,7 +67,7 @@ class ValidatedDecision:
     original: TradeDecision
     approved: bool = False
     adjusted_leverage: float = 0.0
-    adjusted_quantity: float = 0.0
+    adjusted_position_size: float = 0.0
     rejection_reasons: list[str] = field(default_factory=list)
     margin_required: float = 0.0
     max_loss: float = 0.0
@@ -73,8 +77,8 @@ class ValidatedDecision:
         return self.adjusted_leverage if self.approved else 0.0
 
     @property
-    def final_quantity(self) -> float:
-        return self.adjusted_quantity if self.approved else 0.0
+    def final_position_size(self) -> float:
+        return self.adjusted_position_size if self.approved else 0.0
 
 
 @dataclass

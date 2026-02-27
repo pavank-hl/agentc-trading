@@ -54,7 +54,14 @@ amount: 3, leverage: 100 → 3 × 100 = $300.00 ← BETTER.
 
 ---
 
-## The 5-Minute Trading Loop
+## The Two-Prompt Trading Loop
+
+This system uses **two separate analysis passes** per cycle:
+
+1. **Pass 1 (Analysis):** Pure market analysis — always output LONG or SHORT for every symbol with confidence 0-100. No awareness of positions.
+2. **Pass 2 (Position Management):** Only when positions exist. Compare your analysis against current positions and decide: HOLD, CLOSE, or new direction.
+
+Both passes use the same `{"decisions": [...]}` JSON format. See [POSITION_MANAGEMENT.md](POSITION_MANAGEMENT.md) for the full decision matrix, confidence thresholds, and reversal execution flow.
 
 ```python
 # 1. Get market data + indicators (all pre-computed)
@@ -66,13 +73,23 @@ prompt = system.get_prompt()
 #    GET /v1/account/balance    → what you can actually spend
 #    (or use wallet skill for balance)
 
-# 3. Analyze prompt["system_prompt"] + prompt["user_prompt"], produce JSON
-response_json = '{"decisions": [...]}'
+# 3. PASS 1: Analyze prompt (always output LONG/SHORT, never HOLD/CLOSE)
+#    Read prompt["system_prompt"] + prompt["user_prompt"], produce analysis JSON
+analysis_json = '{"decisions": [...]}'
 
-# 4. Submit decision for validation
-result = system.submit_decision(response_json)
+# 4. PASS 2: Position management (only if positions exist)
+positions_json = '...'  # Raw JSON from GET /v1/account/positions
+pos_prompt = system.get_position_prompt(analysis_json, positions_json)
+if pos_prompt is not None:
+    # Positions exist → read pos_prompt, apply decision matrix from POSITION_MANAGEMENT.md
+    decision_json = '...'  # HOLD/CLOSE/LONG/SHORT per symbol
+    result = system.submit_decision(decision_json)
+else:
+    # No positions → submit analysis directly
+    result = system.submit_decision(analysis_json)
 
 # 5. Execute approved trades via x402 VoltPerps API (POST /v1/intent)
+#    For reversals: close existing position FIRST, verify, then open new one
 
 # 6. Verify the trade went through (GET /v1/account/positions)
 
@@ -86,7 +103,7 @@ prompt = system.get_prompt()
 ```
 
 Returns:
-- `prompt["system_prompt"]` — Trading rules, signal categories, position sizing framework, output format
+- `prompt["system_prompt"]` — Analysis-only rules: always output LONG/SHORT, quality score 0-100, 7 filters, quality-gated leverage as % of effective max
 - `prompt["user_prompt"]` — Current market data for all 3 symbols (ETH, BTC, SOL) including:
   - **Core indicators** (3 timeframes: 5m, 15m, 1h): RSI, MACD, Bollinger Bands, EMA alignment, VWAP, ATR
   - **TAAPI indicators**: StochRSI, ADX, CCI, OBV, Taker Buy/Sell flow
@@ -95,8 +112,11 @@ Returns:
   - **Derivatives**: funding rate, funding 24h avg + trend, OI, L/S ratio, liquidation volumes + bias
   - **Sentiment**: Fear & Greed Index, Spot-Futures basis
   - **Volume delta** from recent trades
+  - **Effective max leverage** per symbol (based on `leverage_pct` config)
 
 **This prompt contains ONLY market data and indicators. It does NOT contain position or balance information.** You MUST get that from the VoltPerps API (Step 2).
+
+**The analysis prompt NEVER outputs HOLD or CLOSE.** Every symbol gets a LONG or SHORT call with confidence 0-100.
 
 ### Step 2: Check Positions, Orders, and Balance (MANDATORY — EVERY CYCLE)
 
@@ -187,69 +207,95 @@ Query parameters (all optional): `symbol`, `status` (OPEN/FILLED/CANCELLED), `si
 
 If there are pending or open orders for a symbol, **do not send another trade for that symbol.** Wait for the existing order to resolve.
 
-### Step 3: Analyze and Decide
+### Step 3: Analyze — Pass 1 (Pure Market Analysis)
 
-Read both prompts + the real position/balance data from Step 2.
+Read the analysis prompt + the real balance data from Step 2. **Do NOT factor in position data for this analysis.** This pass is purely about market direction.
 
 Use the **two-layer framework** — foundational (flow) signals drive direction, technicals refine entry:
 
 | Layer | Weight | What to Check |
 |-------|--------|---------------|
-| **Layer 1: Foundational Edge** (direction) | 70% | Funding rate + trend, OI health (price+OI relationship), taker flow (>60% = directional), orderbook imbalance, volume delta, liquidation bias, L/S ratio, Fear & Greed, spot-futures basis |
+| **Layer 1: Foundational Edge** (direction) | 70% | Funding rate + trend, OI health (price+OI relationship), taker flow (>60% = directional), orderbook imbalance + absorption, volume delta, liquidation bias, L/S ratio, Fear & Greed, spot-futures basis, Vol/OI participation |
 | **Layer 2: Technical Execution** (timing) | 30% | EMA alignment (9>21>50 = bullish), Price vs VWAP, MACD, ADX (>25 = strong trend), RSI, StochRSI, CCI, Bollinger %B, candle streaks |
 
-**Compute a Setup Quality Score (0-100) for each trade:**
+**Compute a Setup Quality Score (0-100) for each symbol:**
 - Foundational sub-score (0-50): funding +10, OI health +10, taker flow +10, orderbook +10, liquidation fuel +10
 - Sentiment sub-score (0-20): Fear & Greed alignment +10, L/S ratio + basis +10
 - Technical sub-score (0-30): EMA alignment +10, RSI/StochRSI timing +10, ADX strength +10
 
-**Quality-Gated Position Sizing (use with REAL balance from Step 2):**
+**Quality-Gated Leverage (as % of effective max shown in market data):**
 
-| Score | Leverage | Margin % of Wallet | Example ($2 wallet) |
-|-------|----------|-------------------|---------------------|
-| **75-100** (high conviction) | 80x-100x | 60-80% | $1.50 × 100x = $150 |
-| **55-74** (standard trade) | 45x-75x | 35-55% | $0.90 × 60x = $54 |
-| **40-54** (cautious trade) | 20x-40x | 15-30% | $0.50 × 30x = $15 |
-| **<40** | — | — | HOLD — insufficient quality |
+| Score | Leverage (% of effective max) | Margin % of Wallet |
+|-------|-------------------------------|-------------------|
+| **75-100** (high conviction) | 80-100% | 60-80% |
+| **55-74** (standard trade) | 50-75% | 35-55% |
+| **40-54** (cautious trade) | 20-45% | 15-30% |
+| **<40** (low quality) | Minimum viable | 10-15% |
 
-**7 Filters (checked every setup):** Range position (don't short bottom 20% / long top 20% of 24h range), structural contradiction detection, choppiness compound filter (ADX<18 + neutral funding + flat OI → HOLD), counter-trend leverage cap (60x max), ATR target realism (TP ≤ 2.5× 1h ATR), fee awareness (TP ≥ 0.18% from entry), duration-leverage coherence (distant TP + high leverage → cap at 60x).
+**Score <40 still gets a direction + trade params.** The position manager decides whether to act.
 
-**For symbols with an existing position (from Step 2):** Default is HOLD. Only CLOSE when the original trade thesis is broken (2+ categories flipped against you). A small unrealized loss is NOT a reason to close — the exchange-side TP/SL handles that.
+**7 Filters (checked every setup):** Range position (don't short bottom 20% / long top 20% of 24h range — subtract 10), structural contradiction (subtract 15), choppiness compound filter (ADX<18 + neutral funding + flat OI — subtract 15), counter-trend leverage cap (60% of effective max), ATR target realism (TP ≤ 2.5× 1h ATR), fee/break-even awareness (TP ≥ 0.18% from entry), duration-leverage coherence (distant TP + high leverage → cap).
 
-### Step 4: Submit Your Decision
+**Output: ALWAYS LONG or SHORT for every symbol.** Never HOLD, never CLOSE. Include quality score and full trade params.
+
+### Step 4: Position Management — Pass 2 (When Positions Exist)
+
+After your analysis, check if any positions exist (from Step 2). If yes, use `get_position_prompt()` for a second pass.
+
+```python
+pos_prompt = system.get_position_prompt(analysis_json, positions_json)
+```
+
+**Input:**
+- `analysis_json`: Your raw JSON output from Pass 1
+- `positions_json`: Raw JSON response from `GET /v1/account/positions` — pass it directly, the system handles unwrapping
+
+**Returns:**
+- `{"system_prompt": str, "user_prompt": str}` if any positions exist
+- `None` if no positions — submit your analysis JSON directly to `submit_decision()`
+
+Read `pos_prompt["system_prompt"]` + `pos_prompt["user_prompt"]` and apply the decision matrix from [POSITION_MANAGEMENT.md](POSITION_MANAGEMENT.md). Output the same `{"decisions": [...]}` format.
+
+### Step 5: Submit Your Decision
 
 ```python
 response_json = '''{
   "decisions": [
     {
       "symbol": "PERP_ETH_USDC",
-      "action": "LONG",
+      "direction": "LONG",
+      "confidence": 75,
+      "summary": "Score: 75/100. ADX 35, 15m+1h EMAs bullish, StochRSI oversold, taker 65% buy",
       "leverage": 100,
-      "quantity": 0.05,
-      "stop_loss": 1960.0,
-      "take_profit": 2060.0,
-      "confidence": 0.75,
-      "reasoning": "ADX 35, 15m+1h EMAs bullish, StochRSI oversold, taker 65% buy"
+      "positionSize": 0.05,
+      "stopLoss": 1960.0,
+      "takeProfit": 2060.0,
+      "entryPrice": 2000.0,
+      "riskLevel": "HIGH"
     },
     {
       "symbol": "PERP_BTC_USDC",
-      "action": "HOLD",
-      "leverage": 1,
-      "quantity": 0,
-      "stop_loss": 0,
-      "take_profit": 0,
+      "direction": "HOLD",
       "confidence": 0,
-      "reasoning": "ADX 15 choppy, no clear signal"
+      "summary": "ADX 15 choppy, no clear signal",
+      "leverage": 1,
+      "positionSize": 0,
+      "stopLoss": 0,
+      "takeProfit": 0,
+      "entryPrice": 0,
+      "riskLevel": "LOW"
     },
     {
       "symbol": "PERP_SOL_USDC",
-      "action": "SHORT",
+      "direction": "SHORT",
+      "confidence": 60,
+      "summary": "Score: 60/100. RSI 72, StochRSI 85, funding rising, bearish divergence",
       "leverage": 50,
-      "quantity": 12.5,
-      "stop_loss": 155.0,
-      "take_profit": 140.0,
-      "confidence": 0.6,
-      "reasoning": "RSI 72, StochRSI 85, funding rising, bearish divergence"
+      "positionSize": 12.5,
+      "stopLoss": 155.0,
+      "takeProfit": 140.0,
+      "entryPrice": 148.0,
+      "riskLevel": "MEDIUM"
     }
   ]
 }'''
@@ -266,10 +312,10 @@ result = system.submit_decision(response_json)
     "decisions": [
         {
             "symbol": "PERP_ETH_USDC",
-            "action": "LONG",
+            "direction": "LONG",
             "approved": True,
             "leverage": 100.0,
-            "quantity": 0.04,
+            "positionSize": 0.04,
             "rejection_reasons": []
         },
         ...
@@ -277,7 +323,7 @@ result = system.submit_decision(response_json)
 }
 ```
 
-### Step 5: Pre-Execution Validation (MANDATORY)
+### Step 6: Pre-Execution Validation (MANDATORY)
 
 Before sending ANY trade to the API:
 
@@ -286,7 +332,7 @@ Before sending ANY trade to the API:
 3. **No duplicate positions**: Check positions from Step 2 — if a position already exists for this symbol, don't open another
 4. **No duplicate orders**: Check orders from Step 2 — if an order is already in flight, don't send another
 
-### Step 6: Execute Approved Trades via x402 VoltPerps API
+### Step 7: Execute Approved Trades via x402 VoltPerps API
 
 **Base URL:** `https://x402-dev.voltperps.com/v1`
 
@@ -406,7 +452,7 @@ Free — no x402 payment required.
 { "intent": "claim", "userWallet": "0x..." }
 ```
 
-### Step 7: Verify the Trade
+### Step 8: Verify the Trade
 
 **After every trade, verify it went through.** Do NOT assume success.
 
@@ -445,12 +491,33 @@ Returns a dict with exactly two string keys:
 
 ```python
 {
-    "system_prompt": str,  # Two-layer framework, quality score, 7 filters, quality-gated leverage, output format
+    "system_prompt": str,  # Analysis-only: always LONG/SHORT, quality score, 7 filters, leverage as % of effective max
     "user_prompt": str     # Current market data for all symbols (structured text)
 }
 ```
 
 The `system_prompt` is static — same every cycle. The `user_prompt` changes every cycle with fresh market data.
+
+**Important:** The analysis prompt NEVER outputs HOLD or CLOSE. Every symbol gets LONG or SHORT with confidence 0-100.
+
+### `get_position_prompt(analysis_json, positions_json)` → `dict | None`
+
+Builds the position management prompt for LLM call #2.
+
+```python
+pos_prompt = system.get_position_prompt(analysis_json, positions_json)
+# Returns {"system_prompt": str, "user_prompt": str} or None
+```
+
+**Parameters:**
+- `analysis_json` (str): Raw JSON output from LLM call #1
+- `positions_json` (str): Raw JSON response from `GET /v1/account/positions`. Pass it directly — the system handles unwrapping the `data` envelope.
+
+**Returns:**
+- `{"system_prompt": str, "user_prompt": str}` — if any positions exist. The user prompt contains analysis results + position data side by side.
+- `None` — if no positions. Use `analysis_json` directly with `submit_decision()`.
+
+The position management prompt outputs the same `{"decisions": [...]}` format, so `submit_decision()` works unchanged.
 
 ### `user_prompt` Structure (per symbol)
 
@@ -542,13 +609,15 @@ You must pass a raw JSON string. The system parses it, validates each decision t
   "decisions": [
     {
       "symbol": "PERP_ETH_USDC",
-      "action": "LONG",
+      "direction": "LONG",
+      "confidence": 75,
+      "summary": "Score: 75/100. ADX 35, 15m+1h EMAs bullish, StochRSI oversold, taker 65% buy",
       "leverage": 100,
-      "quantity": 0.05,
-      "stop_loss": 1960.0,
-      "take_profit": 2060.0,
-      "confidence": 0.75,
-      "reasoning": "ADX 35, 15m+1h EMAs bullish, StochRSI oversold, taker 65% buy"
+      "positionSize": 0.05,
+      "stopLoss": 1960.0,
+      "takeProfit": 2060.0,
+      "entryPrice": 2000.0,
+      "riskLevel": "HIGH"
     }
   ]
 }
@@ -557,18 +626,20 @@ You must pass a raw JSON string. The system parses it, validates each decision t
 | Field | Type | Required | Values |
 |-------|------|----------|--------|
 | `symbol` | string | Yes | `PERP_ETH_USDC`, `PERP_BTC_USDC`, `PERP_SOL_USDC` |
-| `action` | string | Yes | `LONG`, `SHORT`, `HOLD`, `CLOSE` |
-| `leverage` | number | Yes | 1-100+ (must satisfy amount × leverage ≥ $10.50) |
-| `quantity` | number | Yes | Position size in base asset (0 for HOLD/CLOSE) |
-| `stop_loss` | number | Yes | Absolute price level (0 for HOLD) |
-| `take_profit` | number | Yes | Absolute price level (0 for HOLD) |
-| `confidence` | number | Yes | 0.0-1.0 |
-| `reasoning` | string | Yes | Brief explanation of which categories agree |
+| `direction` | string | Yes | `LONG`, `SHORT`, `HOLD`, `CLOSE` |
+| `confidence` | number | Yes | 0-100 (quality score) |
+| `summary` | string | Yes | 1-2 sentences: foundational edge first, TA second |
+| `leverage` | number | Yes | 1-100 (must satisfy positionSize × leverage × entryPrice ≥ $10.50) |
+| `positionSize` | number | Yes | Position size in base asset (0 for HOLD/CLOSE) |
+| `stopLoss` | number | Yes | Absolute price level (0 for HOLD) |
+| `takeProfit` | number | Yes | Absolute price level (0 for HOLD) |
+| `entryPrice` | number | Yes | Current mark price or target entry (0 for HOLD) |
+| `riskLevel` | string | Yes | `LOW` (<40), `MEDIUM` (40-74), `HIGH` (75-100) |
 
 **Rules:**
 - One decision per symbol. Always include all 3 symbols.
-- HOLD: `leverage=1, quantity=0, stop_loss=0, take_profit=0, confidence=0`
-- CLOSE: `quantity=0` (system closes full position), `leverage=1, stop_loss=0, take_profit=0`
+- HOLD: `leverage=1, positionSize=0, stopLoss=0, takeProfit=0, entryPrice=0, confidence=0`
+- CLOSE: `positionSize=0` (system closes full position), `leverage=1, stopLoss=0, takeProfit=0, entryPrice=0`
 
 ### `submit_decision()` → `dict`
 
@@ -582,37 +653,37 @@ Returns a dict with validation results:
     "decisions": [                 # list — one entry per decision submitted
         {
             "symbol": "PERP_ETH_USDC",  # str — the symbol
-            "action": "LONG",            # str — your requested action
+            "direction": "LONG",         # str — your requested direction
             "approved": True,            # bool — True if risk manager approved
             "leverage": 100.0,           # float — final leverage (may be adjusted)
-            "quantity": 0.04,            # float — final quantity (may be adjusted)
+            "positionSize": 0.04,        # float — final position size (may be adjusted)
             "rejection_reasons": []      # list[str] — empty if approved
         },
         {
             "symbol": "PERP_BTC_USDC",
-            "action": "HOLD",
+            "direction": "HOLD",
             "approved": True,
             "leverage": 0.0,
-            "quantity": 0.0,
+            "positionSize": 0.0,
             "rejection_reasons": []
         },
         {
             "symbol": "PERP_SOL_USDC",
-            "action": "SHORT",
+            "direction": "SHORT",
             "approved": False,
             "leverage": 0.0,
-            "quantity": 0.0,
-            "rejection_reasons": ["Notional below minimum $10.50"]
+            "positionSize": 0.0,
+            "rejection_reasons": ["Order value $9.00 below $10.50 minimum"]
         }
     ]
 }
 ```
 
 **Key fields to check:**
-- `approved` — **only execute trades where `approved: True` and `action` is LONG/SHORT/CLOSE**. Never execute rejected trades.
-- `leverage` and `quantity` — the risk manager may adjust these down from what you requested. **Use these final values** when executing via the API, not your original values.
-- `rejection_reasons` — tells you why a trade was rejected (e.g., "Notional below minimum $10.50", "No price/indicator data"). Use this to fix the issue in the next cycle.
-- HOLD decisions are always `approved: True` with `leverage: 0.0, quantity: 0.0` — they require no action.
+- `approved` — **only execute trades where `approved: True` and `direction` is LONG/SHORT/CLOSE**. Never execute rejected trades.
+- `leverage` and `positionSize` — the risk manager may adjust these down from what you requested. **Use these final values** when executing via the API, not your original values.
+- `rejection_reasons` — tells you why a trade was rejected (e.g., "Order value below $10.50 minimum", "No price/indicator data"). Use this to fix the issue in the next cycle.
+- HOLD decisions are always `approved: True` with `leverage: 0.0, positionSize: 0.0` — they require no action.
 
 ### How to Use These Responses
 
@@ -630,8 +701,8 @@ Returns a dict with validation results:
 **After `submit_decision()`** — execution flow:
 
 1. Loop through `result["decisions"]`
-2. For each decision where `approved == True` and `action` in (`LONG`, `SHORT`, `CLOSE`):
-   - Use `result["decisions"][i]["leverage"]` and `result["decisions"][i]["quantity"]` (the risk-adjusted values)
+2. For each decision where `approved == True` and `direction` in (`LONG`, `SHORT`, `CLOSE`):
+   - Use `result["decisions"][i]["leverage"]` and `result["decisions"][i]["positionSize"]` (the risk-adjusted values)
    - Convert to API format: symbol → short name, SL/TP → percentages
    - Execute via `POST /v1/intent`
    - Verify via `GET /v1/account/positions`

@@ -32,22 +32,30 @@ logger = logging.getLogger(__name__)
 
 PROMPT_TEMPLATE_PATH = Path(__file__).parent.parent / "prompt_template.md"
 
-SYSTEM_PROMPT = """You are an expert perpetual futures swing trader on Orderly Network. You receive pre-computed technical indicators for multiple symbols and output JSON trading decisions.
+# All markets support 100x max leverage on Orderly Network.
+# leverage_pct config (from LEVERAGE_PCT env var) defines what % to use.
+MARKET_MAX_LEVERAGE = 100
+
+ANALYSIS_PROMPT = """You are an expert perpetual futures analyst on Orderly Network. You receive pre-computed technical indicators for multiple symbols and output a directional call for each.
 
 ## Your Job
-- You are a SWING TRADER, not a passive observer. Your job is to find trades, not reasons to avoid them.
-- Analyze all symbols for actionable setups. HOLD is for genuinely conflicting, flat, or low-quality signals.
-- The risk manager will protect the downside — your job is to find high-quality opportunities.
+- You ALWAYS output LONG or SHORT for every symbol. Never HOLD, never CLOSE.
+- You are a pure market analyst. You have no awareness of existing positions — that is handled separately.
+- Your job: determine the most likely direction for each symbol and rate your confidence 0-100.
 
 ## Decision Framework — Two Layers
 
 ### Layer 1: Foundational Edge (70% of decision weight) — DETERMINES DIRECTION
 These are LEADING signals. They tell you which way to trade BEFORE price confirms.
 
-**Funding + OI:**
+**Funding + OI (rules of thumb):**
 - Funding rate direction, magnitude, and 24h trend
-- Price + OI relationship: price up + OI stable = healthy; price up + OI surging + high funding = crowded/fragile
+- Price up + OI stable = healthy trend continuation
+- Price up + OI surging + high funding = crowded/fragile — fade or wait
+- Price up + OI dropping = short squeeze / forced covering — continuation likely
 - OI flush (sharp OI drop + price move) = forced liquidation cascade — trade the continuation
+- Funding flipping from positive to negative (or vice versa) = regime change — high signal
+- Extreme funding (>0.01% per 8h) = crowded side, mean-reversion risk
 
 **Liquidations:**
 - Long squeeze (longs getting wiped) = bearish cascade risk
@@ -62,7 +70,12 @@ These are LEADING signals. They tell you which way to trade BEFORE price confirm
 **Orderbook:**
 - Imbalance >0.2 = directional pressure
 - Bid-heavy book = buy wall support; ask-heavy = sell wall resistance
+- Absorption: large resting orders being eaten = breakout imminent in that direction
 - Est. slippage: >5bps = thin book (reduce size); <2bps = deep book (full size OK)
+
+**Vol/OI Participation Gate:**
+- Vol/OI ratio < 0.5 = stale positioning, low participation — subtract 5 from score
+- Vol/OI ratio > 2.0 = very active turnover — signals are fresher, more reliable
 
 **Sentiment:**
 - Fear & Greed: <25 = extreme fear (contrarian buy), >75 = extreme greed (contrarian sell)
@@ -87,7 +100,7 @@ These are LAGGING signals. Use them to time entries and place SL/TP, NOT to dete
 - Recent candle trend and % change: detect sharp moves lagging indicators miss
 
 ## Setup Quality Score (0-100)
-For every potential LONG/SHORT, compute a quality score:
+For EVERY symbol, compute a quality score. This score determines confidence and leverage — but you ALWAYS output a direction.
 
 **Foundational sub-score (0-50):**
 - Funding alignment: +10 (funding favors your direction or is neutral)
@@ -107,20 +120,25 @@ For every potential LONG/SHORT, compute a quality score:
 
 Include "Score: XX/100" in your reasoning.
 
-## Quality-Gated Leverage
+## Quality-Gated Leverage (as % of Effective Max)
 
-| Score | Leverage Range | Margin % of Wallet | Action |
-|-------|---------------|-------------------|--------|
-| 75-100 | 80x-100x | 60-80% | High conviction trade |
-| 55-74 | 45-75x | 35-55% | Standard trade |
-| 40-54 | 20-40x | 15-30% | Cautious trade |
-| <40 | — | — | HOLD — insufficient quality |
+Each symbol has an "effective max leverage" shown in the market data. Use this table:
+
+| Score | Leverage Range (% of effective max) | Margin % of Wallet |
+|-------|-------------------------------------|-------------------|
+| 75-100 | 80-100% of effective max | 60-80% |
+| 55-74 | 50-75% of effective max | 35-55% |
+| 40-54 | 20-45% of effective max | 15-30% |
+| <40 | Minimum viable (enough for $10.50 notional) | 10-15% |
+
+**Score <40 still gets a direction + trade params** — the position manager will decide whether to act.
 
 ## 7 Filters (check every setup)
 
 ### 1. Range Position
 - Don't SHORT if price is in bottom 20% of 24h range (Range Position <20%) unless strong continuation evidence (taker sell >65% + falling OI)
 - Don't LONG if price is in top 20% of 24h range (Range Position >80%) unless strong continuation evidence (taker buy >65% + stable/rising OI)
+- If filter triggers, note it in reasoning and subtract 10 from score
 
 ### 2. Structural Contradiction
 - Taker selling + bid-heavy orderbook = contradiction → subtract 15 from score
@@ -128,31 +146,36 @@ Include "Score: XX/100" in your reasoning.
 - If detected, note it in reasoning
 
 ### 3. Choppiness Compound Filter
-- ADX < 18 + neutral funding + flat OI = choppy environment → HOLD
+- ADX < 18 + neutral funding + flat OI = choppy environment → subtract 15 from score
 - All three conditions must be true simultaneously
+- Still output a direction — just with reduced score
 
 ### 4. Counter-Trend Constraints
-- Trading against 1h EMA alignment → cap leverage at 60x, tighten TP to 1.5x ATR
+- Trading against 1h EMA alignment → cap leverage at 60% of effective max, tighten TP to 1.5x ATR
 - e.g., shorting when 1h EMA alignment = bullish, or longing when bearish
 
 ### 5. ATR-Derived Target Realism
 - TP distance must not exceed 2.5x the 1h ATR
 - If your TP is farther than 2.5 × ATR(14) on 1h, bring it closer
 
-### 6. Fee Awareness
+### 6. Fee Awareness + Break-Even Distance
 - TP distance must be ≥ 0.18% from entry (3x round-trip taker fees at 0.03% each side)
-- If TP is closer than 0.18%, the trade is unprofitable after fees → HOLD
+- If TP is closer than 0.18%, widen it or subtract 10 from score
+- Check: at your chosen leverage, is the liquidation price farther than the SL? If not, reduce leverage.
 
 ### 7. Duration-Leverage Coherence
-- If TP is >1.5x ATR away (meaning it will take time to hit) AND leverage >60x → cap leverage at 60x
+- If TP is >1.5x ATR away (meaning it will take time to hit) AND leverage >60% of effective max → cap leverage at 60%
 - Distant targets + high leverage = liquidation risk during normal volatility
+
+## Net Expectancy Check
+Before finalizing, estimate: (win% × avg_win) - (loss% × avg_loss). If negative at your SL/TP levels, widen TP or tighten SL until positive. Note the estimate in reasoning.
 
 ## CRITICAL: Minimum Order Value — amount × leverage ≥ $10.50
 **Every trade MUST satisfy: amount × leverage ≥ $10.50.** Orders below this are REJECTED by the exchange.
 
 ## Position Sizing
 
-Given your wallet balance (from wallet skill), use the Quality-Gated Leverage table above. Then:
+Given your wallet balance (from market data), use the Quality-Gated Leverage table above. Then:
 
 amount = wallet_balance × margin_pct
 notional = amount × leverage
@@ -160,32 +183,11 @@ notional = amount × leverage
 CHECK 1: notional ≥ $10.50? If not, increase leverage.
 CHECK 2: amount ≤ wallet_balance? Must be true.
 
-### Examples with $2 wallet:
-Score 85: amount=$1.50 (75%), leverage=100x → $150 position ✓
-Score 65: amount=$0.90 (45%), leverage=60x → $54 position ✓
-Score 45: amount=$0.50 (25%), leverage=30x → $15 position ✓
-Score 35: → HOLD
-
 ### SL/TP Rules
 - Set stop-loss 1-2 ATR from entry at a technical level (EMA, BB band, recent swing)
 - Set take-profit at 2:1 or better risk:reward, capped at 2.5x 1h ATR
 - TP must be ≥ 0.18% from entry (fee awareness)
 - ALWAYS verify: amount × leverage ≥ $10.50
-
-## Managing Open Positions
-**You must check real positions via GET /v1/account/positions every cycle.** Never assume a position exists from a previous cycle.
-
-The exchange handles SL/TP automatically via algo orders. Your job is to decide whether to HOLD or CLOSE based on current signals.
-
-**Default is HOLD.** Only CLOSE when the original trade thesis is BROKEN:
-- The trend that justified entry has clearly reversed (EMA alignment flipped, MACD crossed against you on 15m+)
-- Multiple signal categories that supported the entry now oppose it
-- A small unrealized loss or flat P&L is NOT a reason to close — the exchange TP/SL handles exits
-
-**CLOSE when:**
-- 2+ signal categories have flipped against the position direction
-- Price action shows clear reversal pattern confirmed by trend indicators
-- The reason you entered no longer exists (e.g., bullish EMA alignment is now bearish)
 
 ## Cross-Symbol
 - BTC often leads ETH and SOL
@@ -198,24 +200,90 @@ Output ONLY valid JSON (no markdown fences):
   "decisions": [
     {
       "symbol": "PERP_ETH_USDC",
-      "action": "LONG|SHORT|HOLD|CLOSE",
-      "leverage": 1,
-      "quantity": 0.0,
-      "stop_loss": 0.0,
-      "take_profit": 0.0,
-      "confidence": 0.0,
-      "reasoning": "Score: XX/100. Which layers agree and why. Filters checked."
+      "direction": "LONG|SHORT",
+      "confidence": 72,
+      "summary": "Score: 72/100. Funding bullish +10, OI healthy +10, taker 62% buy +10, ...",
+      "leverage": 50,
+      "positionSize": 0.05,
+      "stopLoss": 1960.0,
+      "takeProfit": 2060.0,
+      "entryPrice": 2000.0,
+      "riskLevel": "MEDIUM"
     }
   ]
 }
 
 Rules:
-- One decision per symbol. Always include all symbols.
-- HOLD: leverage=1, quantity=0, stop_loss=0, take_profit=0, confidence=0
-- CLOSE: quantity=0 (system closes full position)
-- Confidence: 0.0-1.0 (maps roughly to score/100)
-- Leverage: USE HIGH LEVERAGE gated by quality score. Your stop-loss protects the downside.
-- FINAL CHECK: amount × leverage ≥ $10.50. If not, increase leverage."""
+- One decision per symbol. Always include ALL symbols.
+- direction is ALWAYS "LONG" or "SHORT". Never "HOLD" or "CLOSE".
+- confidence: 0-100 integer (maps to quality score). Even low-confidence calls get a direction.
+- riskLevel: "LOW" (score <40), "MEDIUM" (40-74), "HIGH" (75-100).
+- entryPrice: current mark price or your target entry level.
+- leverage: gated by quality score as % of effective max shown in market data.
+- FINAL CHECK: positionSize × leverage × entryPrice ≥ $10.50. If not, increase leverage."""
+
+
+POSITION_PROMPT = """You are a position management analyst. You receive market analysis results (with directional calls and confidence scores) and current position data. Your job is to compare each symbol's analysis against its existing position and decide what to do.
+
+## What You Receive
+
+For each symbol you get:
+- **Analysis result**: direction (LONG/SHORT), confidence (0-100), suggested trade params (leverage, size, SL, TP, entry)
+- **Position data** (if exists): side, size, entry price, mark price, PnL, leverage, liquidation price, and active TP/SL algo orders
+
+## Reading Position Data
+
+- **PnL**: Unrealized profit/loss. Negative = underwater. But a small loss is NOT a reason to close — the exchange TP/SL handles that.
+- **Liquidation price**: If mark price is approaching this, the position is at risk. Factor this into urgency.
+- **TAKE_PROFIT / STOP_LOSS orders**: The exchange will auto-exit at these levels. If they're well-placed, HOLD is safer. If the analysis suggests the TP won't be reached, consider CLOSE.
+
+## Decision Matrix — When a Position EXISTS
+
+| Analysis Direction | Confidence | Your Output | Rationale |
+|---|---|---|---|
+| Same as position | >= 50 | HOLD | Thesis confirmed, let it run |
+| Same as position | < 50 | CLOSE | Thesis weakening, exit before SL |
+| Opposite of position | < 50 | HOLD | Weak opposing signal, not enough to reverse |
+| Opposite of position | >= 50 | Output the NEW direction (LONG/SHORT with trade params from analysis) | Strong opposing signal — reverse the position |
+
+## Decision Matrix — When NO Position Exists
+
+| Confidence | Your Output | Rationale |
+|---|---|---|
+| >= 40 | Output direction (LONG/SHORT with trade params from analysis) | Sufficient quality to enter |
+| < 40 | HOLD | Signal too weak to open a new position |
+
+## For Reversals
+When you output a new direction that opposes an existing position, the agent will:
+1. Close the existing position first
+2. Then open the new position with your suggested trade params
+
+Output the NEW direction with the trade params from the analysis. The agent handles the close.
+
+## Output Format
+Output ONLY valid JSON (no markdown fences). Same format as analysis — one decision per symbol, ALL symbols included:
+{
+  "decisions": [
+    {
+      "symbol": "PERP_ETH_USDC",
+      "direction": "LONG|SHORT|HOLD|CLOSE",
+      "confidence": 72,
+      "summary": "Position: LONG. Analysis: LONG @ 72/100. Same direction, confidence >= 50 → HOLD.",
+      "leverage": 50,
+      "positionSize": 0.05,
+      "stopLoss": 1960.0,
+      "takeProfit": 2060.0,
+      "entryPrice": 2000.0,
+      "riskLevel": "MEDIUM"
+    }
+  ]
+}
+
+Rules:
+- HOLD: leverage=1, positionSize=0, stopLoss=0, takeProfit=0, entryPrice=0
+- CLOSE: leverage=1, positionSize=0, stopLoss=0, takeProfit=0, entryPrice=0
+- For LONG/SHORT: use the trade params from the analysis result
+- Always explain: what the position is, what the analysis says, and why you chose this direction."""
 
 
 class StrategyEngine:
@@ -286,7 +354,7 @@ class StrategyEngine:
         self._pending_reports = reports
         self._pending_prices = prices
 
-        return SYSTEM_PROMPT, user_prompt
+        return ANALYSIS_PROMPT, user_prompt
 
     def _enrich_taapi(self, reports: dict[str, IndicatorReport]) -> None:
         """Merge TAAPI indicators into existing reports. No-op if client is None."""
@@ -379,13 +447,13 @@ class StrategyEngine:
                     )
                 validated.append(v)
                 logger.info(
-                    "%s %s: %s (approved=%s, lev=%.1f, qty=%.4f) %s",
+                    "%s %s: %s (approved=%s, lev=%.1f, size=%.4f) %s",
                     decision.symbol,
-                    decision.action.value,
-                    decision.reasoning[:80],
+                    decision.direction.value,
+                    decision.summary[:80],
                     v.approved,
                     v.final_leverage,
-                    v.final_quantity,
+                    v.final_position_size,
                     v.rejection_reasons if not v.approved else "",
                 )
 
@@ -425,6 +493,8 @@ class StrategyEngine:
             parts.append(f"24h Low: {report.ticker_low_24h:.2f}")
             parts.append(f"Range Position: {report.range_percentile:.0f}% (0%=at 24h low, 100%=at 24h high)")
             parts.append(f"Vol/OI Ratio: {report.vol_oi_ratio:.2f}")
+            effective_max = int(MARKET_MAX_LEVERAGE * self.config.leverage_pct / 100)
+            parts.append(f"Effective Max Leverage: {effective_max}x ({self.config.leverage_pct}% of {MARKET_MAX_LEVERAGE}x)")
             parts.append("")
 
             for tf_name, ti in report.timeframes.items():
@@ -470,6 +540,103 @@ class StrategyEngine:
             parts.append("")
 
         parts.append("\nAnalyze all symbols. Output your decisions as JSON.")
+        return "\n".join(parts)
+
+    def get_position_prompt(
+        self,
+        analysis_json: str,
+        positions_json: str,
+    ) -> tuple[str, str] | None:
+        """Build position management prompt for LLM call #2.
+
+        Args:
+            analysis_json: Raw JSON string from LLM call #1 (analysis result).
+            positions_json: Raw JSON from GET /v1/account/positions.
+                Pass the API response directly — the system unwraps it.
+
+        Returns:
+            (system_prompt, user_prompt) if any positions exist.
+            None if no symbols have positions (use analysis directly).
+        """
+        try:
+            analysis = json.loads(analysis_json)
+            positions = json.loads(positions_json)
+        except json.JSONDecodeError:
+            logger.error("Failed to parse JSON in get_position_prompt")
+            return None
+
+        # Handle raw API response: {"success":..., "data": {"positions": [...]}}
+        if "data" in positions:
+            positions = positions["data"]
+        pos_list = positions.get("positions", [])
+        if not pos_list:
+            return None
+
+        user_prompt = self._build_position_user_prompt(analysis, pos_list)
+        return POSITION_PROMPT, user_prompt
+
+    def _build_position_user_prompt(
+        self,
+        analysis: dict,
+        positions: list[dict],
+    ) -> str:
+        """Build user prompt with per-symbol analysis + position data."""
+        # Index positions by symbol
+        pos_by_symbol = {}
+        for p in positions:
+            pos_by_symbol[p.get("symbol", "")] = p
+
+        parts = ["## Analysis Results\n"]
+
+        for decision in analysis.get("decisions", []):
+            symbol = decision.get("symbol", "")
+            direction = decision.get("direction", decision.get("action", ""))
+            confidence = int(decision.get("confidence", 0))
+            leverage = decision.get("leverage", 0)
+            position_size = decision.get("positionSize", decision.get("position_size", decision.get("quantity", 0)))
+            sl = decision.get("stopLoss", decision.get("stop_loss", 0))
+            tp = decision.get("takeProfit", decision.get("take_profit", 0))
+            entry = decision.get("entryPrice", decision.get("entry_price", 0))
+            risk = decision.get("riskLevel", decision.get("risk_level", "MEDIUM"))
+            summary = decision.get("summary", decision.get("reasoning", ""))
+
+            parts.append(f"### {symbol}")
+            parts.append(f"Direction: {direction} | Confidence: {confidence}/100 | Risk: {risk}")
+            parts.append(f"Suggested: leverage={leverage}x, size={position_size}, entry={entry}, SL={sl}, TP={tp}")
+            parts.append(f"Summary: {summary}")
+            parts.append("")
+
+        parts.append("## Current Positions\n")
+
+        # Show position data for all analysis symbols
+        analysis_symbols = [d.get("symbol", "") for d in analysis.get("decisions", [])]
+        for symbol in analysis_symbols:
+            pos = pos_by_symbol.get(symbol)
+            parts.append(f"### {symbol}")
+            if pos:
+                side = pos.get("side", "unknown").upper()
+                size = pos.get("size", 0)
+                entry = pos.get("entryPrice", 0)
+                mark = pos.get("markPrice", 0)
+                pnl = pos.get("pnl", 0)
+                leverage = pos.get("leverage", 0)
+                liq = pos.get("liquidationPrice", 0)
+
+                parts.append(f"Side: {side} | Size: {size} | Entry: {entry:.2f} | Mark: {mark:.2f}")
+                parts.append(f"PnL: ${pnl:.2f} | Leverage: {leverage}x | Liquidation: {liq:.2f}")
+
+                # Show active TP/SL algo orders
+                for order in pos.get("associatedOrders", []):
+                    algo = order.get("algoType", "")
+                    trigger = order.get("triggerPrice", 0)
+                    status = order.get("status", "")
+                    if algo and trigger:
+                        parts.append(f"  {algo}: {trigger:.2f} ({status})")
+            else:
+                parts.append("(No position)")
+            parts.append("")
+
+        parts.append("Compare each symbol's analysis against its position. Output your decisions as JSON.")
         return "\n".join(parts)
 
     def _parse_response(self, response_text: str) -> MultiSymbolDecision:

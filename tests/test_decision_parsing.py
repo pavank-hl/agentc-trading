@@ -10,32 +10,55 @@ class TestTradeDecision:
     def test_from_dict(self):
         d = {
             "symbol": "PERP_ETH_USDC",
-            "action": "LONG",
+            "direction": "LONG",
             "leverage": 5,
-            "quantity": 0.267,
-            "stop_loss": 2940.0,
-            "take_profit": 3120.0,
-            "confidence": 0.72,
-            "reasoning": "Bullish setup",
+            "positionSize": 0.267,
+            "stopLoss": 2940.0,
+            "takeProfit": 3120.0,
+            "entryPrice": 3000.0,
+            "confidence": 72,
+            "riskLevel": "MEDIUM",
+            "summary": "Bullish setup",
         }
         td = TradeDecision.from_dict(d)
         assert td.symbol == "PERP_ETH_USDC"
-        assert td.action == Action.LONG
+        assert td.direction == Action.LONG
         assert td.leverage == 5.0
-        assert td.quantity == 0.267
-        assert td.confidence == 0.72
+        assert td.position_size == 0.267
+        assert td.confidence == 72
+        assert td.entry_price == 3000.0
+        assert td.risk_level == "MEDIUM"
+        assert td.summary == "Bullish setup"
+
+    def test_from_dict_legacy_keys(self):
+        """Backward compat: accept old snake_case keys."""
+        d = {
+            "symbol": "PERP_ETH_USDC",
+            "action": "LONG",
+            "quantity": 0.1,
+            "stop_loss": 2940.0,
+            "take_profit": 3120.0,
+            "confidence": 60,
+            "reasoning": "Old format",
+        }
+        td = TradeDecision.from_dict(d)
+        assert td.direction == Action.LONG
+        assert td.position_size == 0.1
+        assert td.stop_loss == 2940.0
+        assert td.take_profit == 3120.0
+        assert td.summary == "Old format"
 
     def test_from_dict_case_insensitive(self):
-        d = {"symbol": "PERP_BTC_USDC", "action": "hold"}
+        d = {"symbol": "PERP_BTC_USDC", "direction": "hold"}
         td = TradeDecision.from_dict(d)
-        assert td.action == Action.HOLD
+        assert td.direction == Action.HOLD
 
     def test_hold_factory(self):
         td = TradeDecision.hold("PERP_SOL_USDC", "No signal")
-        assert td.action == Action.HOLD
+        assert td.direction == Action.HOLD
         assert td.symbol == "PERP_SOL_USDC"
-        assert td.quantity == 0
-        assert td.reasoning == "No signal"
+        assert td.position_size == 0
+        assert td.summary == "No signal"
 
 
 class TestPosition:

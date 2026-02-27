@@ -56,19 +56,30 @@ def _make_losing_trades(n: int, symbol: str = "PERP_ETH_USDC") -> list[ClosedTra
 class TestConfidenceValidation:
     def test_low_confidence_rejected(self, risk, portfolio, indicator_report):
         decision = TradeDecision(
-            symbol="PERP_ETH_USDC", action=Action.LONG,
-            leverage=5, quantity=0.1, stop_loss=2940.0,
-            take_profit=3120.0, confidence=0.05,
+            symbol="PERP_ETH_USDC", direction=Action.LONG,
+            leverage=5, position_size=0.1, stop_loss=2940.0,
+            take_profit=3120.0, confidence=5,
         )
         result = risk.validate_decision(decision, portfolio, indicator_report, 3000.0)
         assert not result.approved
         assert any("confidence" in r.lower() for r in result.rejection_reasons)
 
+    def test_below_quality_gate_rejected(self, risk, portfolio, indicator_report):
+        """Confidence 39 is below the 40 quality gate for new trades."""
+        decision = TradeDecision(
+            symbol="PERP_ETH_USDC", direction=Action.LONG,
+            leverage=5, position_size=0.1, stop_loss=2940.0,
+            take_profit=3120.0, confidence=39,
+        )
+        result = risk.validate_decision(decision, portfolio, indicator_report, 3000.0)
+        assert not result.approved
+        assert any("40" in r for r in result.rejection_reasons)
+
     def test_leverage_passed_through(self, risk, portfolio, indicator_report):
         decision = TradeDecision(
-            symbol="PERP_ETH_USDC", action=Action.LONG,
-            leverage=5, quantity=0.05, stop_loss=2940.0,
-            take_profit=3120.0, confidence=0.75,
+            symbol="PERP_ETH_USDC", direction=Action.LONG,
+            leverage=5, position_size=0.05, stop_loss=2940.0,
+            take_profit=3120.0, confidence=75,
         )
         result = risk.validate_decision(decision, portfolio, indicator_report, 3000.0)
         assert result.approved
@@ -78,8 +89,8 @@ class TestConfidenceValidation:
 class TestStopLossValidation:
     def test_no_stop_loss_rejected(self, risk, portfolio, indicator_report):
         decision = TradeDecision(
-            symbol="PERP_ETH_USDC", action=Action.LONG,
-            leverage=5, quantity=0.1, stop_loss=0, confidence=0.6,
+            symbol="PERP_ETH_USDC", direction=Action.LONG,
+            leverage=5, position_size=0.1, stop_loss=0, confidence=60,
         )
         result = risk.validate_decision(decision, portfolio, indicator_report, 3000.0)
         assert not result.approved
@@ -87,18 +98,18 @@ class TestStopLossValidation:
 
     def test_long_sl_above_price_rejected(self, risk, portfolio, indicator_report):
         decision = TradeDecision(
-            symbol="PERP_ETH_USDC", action=Action.LONG,
-            leverage=5, quantity=0.1, stop_loss=3100.0,
-            take_profit=3200.0, confidence=0.6,
+            symbol="PERP_ETH_USDC", direction=Action.LONG,
+            leverage=5, position_size=0.1, stop_loss=3100.0,
+            take_profit=3200.0, confidence=60,
         )
         result = risk.validate_decision(decision, portfolio, indicator_report, 3000.0)
         assert not result.approved
 
     def test_short_sl_below_price_rejected(self, risk, portfolio, indicator_report):
         decision = TradeDecision(
-            symbol="PERP_ETH_USDC", action=Action.SHORT,
-            leverage=5, quantity=0.1, stop_loss=2900.0,
-            take_profit=2800.0, confidence=0.6,
+            symbol="PERP_ETH_USDC", direction=Action.SHORT,
+            leverage=5, position_size=0.1, stop_loss=2900.0,
+            take_profit=2800.0, confidence=60,
         )
         result = risk.validate_decision(decision, portfolio, indicator_report, 3000.0)
         assert not result.approved
@@ -106,9 +117,9 @@ class TestStopLossValidation:
     def test_sl_too_tight_rejected(self, risk, portfolio, indicator_report):
         # SL 5 away, ATR is 30 -> 0.17x ATR (< 0.5x minimum)
         decision = TradeDecision(
-            symbol="PERP_ETH_USDC", action=Action.LONG,
-            leverage=5, quantity=0.1, stop_loss=2995.0,
-            take_profit=3120.0, confidence=0.6,
+            symbol="PERP_ETH_USDC", direction=Action.LONG,
+            leverage=5, position_size=0.1, stop_loss=2995.0,
+            take_profit=3120.0, confidence=60,
         )
         result = risk.validate_decision(decision, portfolio, indicator_report, 3000.0)
         assert not result.approved
@@ -119,9 +130,9 @@ class TestRiskReward:
     def test_bad_rr_rejected(self, risk, portfolio, indicator_report):
         # SL 60 away, TP 30 away -> R:R 0.5 (below 1.5 minimum)
         decision = TradeDecision(
-            symbol="PERP_ETH_USDC", action=Action.LONG,
-            leverage=5, quantity=0.1, stop_loss=2940.0,
-            take_profit=3030.0, confidence=0.6,
+            symbol="PERP_ETH_USDC", direction=Action.LONG,
+            leverage=5, position_size=0.1, stop_loss=2940.0,
+            take_profit=3030.0, confidence=60,
         )
         result = risk.validate_decision(decision, portfolio, indicator_report, 3000.0)
         assert not result.approved
@@ -136,31 +147,42 @@ class TestHoldAndClose:
 
     def test_close_always_approved(self, risk, portfolio, indicator_report):
         decision = TradeDecision(
-            symbol="PERP_ETH_USDC", action=Action.CLOSE, confidence=0.5,
+            symbol="PERP_ETH_USDC", direction=Action.CLOSE, confidence=50,
         )
         result = risk.validate_decision(decision, portfolio, indicator_report, 3000.0)
         assert result.approved
 
 
-class TestPositionConflicts:
-    def test_duplicate_position_rejected(self, risk, portfolio, indicator_report):
-        portfolio.open_positions.append(
-            Position(
-                symbol="PERP_ETH_USDC", side=Action.LONG,
-                entry_price=2900, quantity=0.1, leverage=5,
-                stop_loss=2850, take_profit=3000, margin=60.0,
-            )
-        )
+class TestMinimumOrderValue:
+    def test_below_minimum_rejected(self, risk, portfolio, indicator_report):
+        """Order value below $10.50 is rejected."""
+        # size=0.001 * price=3000 * leverage=3 = $9.00 < $10.50
         decision = TradeDecision(
-            symbol="PERP_ETH_USDC", action=Action.LONG,
-            leverage=5, quantity=0.1, stop_loss=2940.0,
-            take_profit=3120.0, confidence=0.6,
+            symbol="PERP_ETH_USDC", direction=Action.LONG,
+            leverage=3, position_size=0.001, stop_loss=2940.0,
+            take_profit=3120.0, confidence=60,
         )
         result = risk.validate_decision(decision, portfolio, indicator_report, 3000.0)
         assert not result.approved
-        assert any("already" in r.lower() for r in result.rejection_reasons)
+        assert any("$10.50" in r for r in result.rejection_reasons)
 
-    def test_opposite_position_rejected(self, risk, portfolio, indicator_report):
+    def test_above_minimum_approved(self, risk, portfolio, indicator_report):
+        """Order value above $10.50 passes."""
+        # size=0.01 * price=3000 * leverage=5 = $150 > $10.50
+        decision = TradeDecision(
+            symbol="PERP_ETH_USDC", direction=Action.LONG,
+            leverage=5, position_size=0.01, stop_loss=2940.0,
+            take_profit=3120.0, confidence=60,
+        )
+        result = risk.validate_decision(decision, portfolio, indicator_report, 3000.0)
+        assert result.approved
+
+
+class TestPositionConflictsRemoved:
+    """Layer 4 (position conflict) was removed — the agent/position manager handles this now."""
+
+    def test_duplicate_position_now_approved(self, risk, portfolio, indicator_report):
+        """With Layer 4 removed, duplicate positions pass risk validation."""
         portfolio.open_positions.append(
             Position(
                 symbol="PERP_ETH_USDC", side=Action.LONG,
@@ -169,10 +191,26 @@ class TestPositionConflicts:
             )
         )
         decision = TradeDecision(
-            symbol="PERP_ETH_USDC", action=Action.SHORT,
-            leverage=5, quantity=0.1, stop_loss=3060.0,
-            take_profit=2880.0, confidence=0.6,
+            symbol="PERP_ETH_USDC", direction=Action.LONG,
+            leverage=5, position_size=0.1, stop_loss=2940.0,
+            take_profit=3120.0, confidence=60,
         )
         result = risk.validate_decision(decision, portfolio, indicator_report, 3000.0)
-        assert not result.approved
-        assert any("opposite" in r.lower() for r in result.rejection_reasons)
+        assert result.approved
+
+    def test_opposite_position_now_approved(self, risk, portfolio, indicator_report):
+        """With Layer 4 removed, opposite positions pass risk validation."""
+        portfolio.open_positions.append(
+            Position(
+                symbol="PERP_ETH_USDC", side=Action.LONG,
+                entry_price=2900, quantity=0.1, leverage=5,
+                stop_loss=2850, take_profit=3000, margin=60.0,
+            )
+        )
+        decision = TradeDecision(
+            symbol="PERP_ETH_USDC", direction=Action.SHORT,
+            leverage=5, position_size=0.1, stop_loss=3060.0,
+            take_profit=2880.0, confidence=60,
+        )
+        result = risk.validate_decision(decision, portfolio, indicator_report, 3000.0)
+        assert result.approved
