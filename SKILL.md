@@ -191,23 +191,28 @@ If there are pending or open orders for a symbol, **do not send another trade fo
 
 Read both prompts + the real position/balance data from Step 2.
 
-Look for **confluence** — 2+ signal categories agreeing on a direction:
+Use the **two-layer framework** — foundational (flow) signals drive direction, technicals refine entry:
 
-| Signal Category | What to Check |
-|----------------|---------------|
-| **Trend** (15m, 1h) | EMA alignment (9 > 21 > 50 = bullish), Price vs VWAP, MACD direction, ADX (>25 = strong trend) |
-| **Momentum** (5m, 15m) | RSI (<40 long, >60 short), StochRSI (<20 oversold, >80 overbought), CCI, Bollinger %B, MACD histogram, candle streaks |
-| **Microstructure** | Orderbook imbalance, taker flow (>60% = directional), volume delta, OBV, slippage estimate |
-| **Derivatives** | Funding rate + trend, OI changes, L/S ratio, liquidation bias |
-| **Sentiment** | Fear & Greed (<25 contrarian buy, >75 contrarian sell), spot-futures basis |
+| Layer | Weight | What to Check |
+|-------|--------|---------------|
+| **Layer 1: Foundational Edge** (direction) | 70% | Funding rate + trend, OI health (price+OI relationship), taker flow (>60% = directional), orderbook imbalance, volume delta, liquidation bias, L/S ratio, Fear & Greed, spot-futures basis |
+| **Layer 2: Technical Execution** (timing) | 30% | EMA alignment (9>21>50 = bullish), Price vs VWAP, MACD, ADX (>25 = strong trend), RSI, StochRSI, CCI, Bollinger %B, candle streaks |
 
-**Position Sizing (use this framework with your REAL balance from Step 2):**
+**Compute a Setup Quality Score (0-100) for each trade:**
+- Foundational sub-score (0-50): funding +10, OI health +10, taker flow +10, orderbook +10, liquidation fuel +10
+- Sentiment sub-score (0-20): Fear & Greed alignment +10, L/S ratio + basis +10
+- Technical sub-score (0-30): EMA alignment +10, RSI/StochRSI timing +10, ADX strength +10
 
-| Setup Strength | Margin % of Wallet | Leverage | Example ($2 wallet) |
-|---------------|-------------------|----------|---------------------|
-| **STRONG** (ADX>30, 3+ categories, OBV confirms, taker flow >60%) | 60-80% | 80x-100x | $1.50 × 100x = $150 |
-| **MODERATE** (ADX 20-30, 2 categories, neutral OBV) | 30-50% | 40x-70x | $0.80 × 50x = $40 |
-| **WEAK** (ADX<20, 2 moderate categories) | 15-25% | 20x-40x | $0.50 × 25x = $12.50 |
+**Quality-Gated Position Sizing (use with REAL balance from Step 2):**
+
+| Score | Leverage | Margin % of Wallet | Example ($2 wallet) |
+|-------|----------|-------------------|---------------------|
+| **75-100** (high conviction) | 80x-100x | 60-80% | $1.50 × 100x = $150 |
+| **55-74** (standard trade) | 45x-75x | 35-55% | $0.90 × 60x = $54 |
+| **40-54** (cautious trade) | 20x-40x | 15-30% | $0.50 × 30x = $15 |
+| **<40** | — | — | HOLD — insufficient quality |
+
+**7 Filters (checked every setup):** Range position (don't short bottom 20% / long top 20% of 24h range), structural contradiction detection, choppiness compound filter (ADX<18 + neutral funding + flat OI → HOLD), counter-trend leverage cap (60x max), ATR target realism (TP ≤ 2.5× 1h ATR), fee awareness (TP ≥ 0.18% from entry), duration-leverage coherence (distant TP + high leverage → cap at 60x).
 
 **For symbols with an existing position (from Step 2):** Default is HOLD. Only CLOSE when the original trade thesis is broken (2+ categories flipped against you). A small unrealized loss is NOT a reason to close — the exchange-side TP/SL handles that.
 
@@ -440,7 +445,7 @@ Returns a dict with exactly two string keys:
 
 ```python
 {
-    "system_prompt": str,  # Trading rules, signal categories, sizing framework, output format
+    "system_prompt": str,  # Two-layer framework, quality score, 7 filters, quality-gated leverage, output format
     "user_prompt": str     # Current market data for all symbols (structured text)
 }
 ```
@@ -459,6 +464,11 @@ Mark Price: 2015.32                    ← current mark price (float)
 Index Price: 2014.98                   ← spot reference price (float)
 24h Change: -1.25%                     ← 24h price change (float %)
 24h Volume: 1234567                    ← 24h trading volume (integer)
+24h High: 2045.00                      ← highest price in 24h
+24h Low: 1985.00                       ← lowest price in 24h
+Range Position: 50% (0%=at 24h low, 100%=at 24h high)
+                                       ← where mark price sits in 24h range
+Vol/OI Ratio: 1.35                     ← 24h volume / open interest
 
 **5m Timeframe:**                      ← repeats for 5m, 15m, 1h
   Last Close: 2015.10                  ← most recent candle close
@@ -514,6 +524,9 @@ Analyze all symbols. Output your decisions as JSON.
 ```
 
 **Notes:**
+- 24h High, 24h Low, Range Position, and Vol/OI Ratio always appear (derived from ticker + OI data).
+- Range Position: 0% = at 24h low, 100% = at 24h high. Use for range filter (don't short <20%, don't long >80%).
+- Vol/OI Ratio: high = active turnover, low = stale positioning.
 - StochRSI/ADX/CCI/OBV/Taker Flow lines only appear when TAAPI data is populated (ADX > 0). Since TAAPI is required, these should always be present.
 - Funding 24h avg + trend only appears when funding history has data.
 - Liquidation lines only appear when there's liquidation activity (volume > 0).
@@ -605,13 +618,13 @@ Returns a dict with validation results:
 
 **After `get_prompt()`** — systematic analysis flow:
 
-1. **Read prices** (Mark, Index, 24h Change) for each symbol to get the big picture
-2. **Check Trend** (15m + 1h): EMA alignment + VWAP + MACD direction + ADX strength
-3. **Check Momentum** (5m + 15m): RSI + StochRSI + CCI + Bollinger %B + candle trend
-4. **Check Microstructure**: Orderbook imbalance + taker flow + volume delta + OBV + slippage
-5. **Check Derivatives**: Funding rate + trend + L/S ratio + liquidation bias
-6. **Check Sentiment**: Fear & Greed + spot-futures basis
-7. **Count agreeing categories** → determine setup strength → apply position sizing framework
+1. **Read prices** (Mark, Index, 24h Change, Range Position) for each symbol to get the big picture
+2. **Layer 1 — Foundational Edge (70%)**: Funding rate + trend, OI health, taker flow, volume delta, orderbook imbalance, liquidations, OBV → determines DIRECTION
+3. **Layer 1 — Sentiment**: Fear & Greed, L/S ratio, spot-futures basis → confirms or warns
+4. **Layer 2 — Technical Execution (30%)**: EMA alignment, VWAP, MACD, ADX, RSI, StochRSI, Bollinger %B → refines ENTRY TIMING and SL/TP placement
+5. **Compute Setup Quality Score** (0-100): foundational (0-50) + sentiment (0-20) + technical (0-30)
+6. **Apply 7 filters**: range position, contradiction, choppiness, counter-trend, ATR realism, fee awareness, duration-leverage
+7. **Quality-gate leverage**: score → leverage range → margin % → verify minimum order value
 8. **Cross-check symbols**: Do BTC/ETH/SOL agree? Correlated moves = stronger conviction
 
 **After `submit_decision()`** — execution flow:
@@ -688,26 +701,29 @@ Returns all supported markets with max leverage. Always check this before using 
 
 ### Indicators (ALL pre-computed in `get_prompt()`)
 
-| Indicator | Source | Signal |
-|-----------|--------|--------|
-| RSI | Orderly WS | <40 long zone, >60 short zone, extremes (<30, >70) strong |
-| MACD | Orderly WS | Crossovers, histogram direction = momentum |
-| Bollinger Bands | Orderly WS | %B <0.3 long, >0.7 short |
-| EMA | Orderly WS | 9>21>50 = bullish, reverse = bearish |
-| VWAP | Orderly WS | Above = bullish bias, below = bearish |
-| ATR | Orderly WS | Volatility for SL placement |
-| Candle trend | Orderly WS | Consecutive red/green, % change |
-| **StochRSI** | TAAPI | K<20 oversold (long), K>80 overbought (short) |
-| **ADX** | TAAPI | >25 strong trend, <20 choppy |
-| **CCI** | TAAPI | <-100 oversold, >+100 overbought |
-| **OBV** | TAAPI | Rising = bullish, divergence = reversal warning |
-| **Taker Flow** | TAAPI | >60% buy = aggressive demand |
-| Orderbook | Orderly WS | Imbalance, spread, depth, est. slippage |
-| Volume delta | Orderly WS | Buy vs sell aggression |
-| **Funding trend** | Orderly WS | Rising/falling/flat funding pressure |
-| **Liquidations** | Binance WS | Long/short squeeze detection |
-| **Fear & Greed** | alternative.me | <25 contrarian buy, >75 contrarian sell |
-| **Spot-Futures Basis** | Orderly WS | >0.1% premium (bullish), <-0.1% discount (bearish) |
+| Indicator | Source | Layer | Signal |
+|-----------|--------|-------|--------|
+| **Funding rate + trend** | Orderly WS | L1 Foundational | Direction + magnitude; rising = long pressure, falling = short pressure |
+| **Liquidations** | Binance WS | L1 Foundational | Long/short squeeze detection, cascade fuel |
+| **Taker Flow** | TAAPI | L1 Foundational | >60% buy = aggressive demand, >60% sell = aggressive selling |
+| **Volume delta** | Orderly WS | L1 Foundational | Positive = buyers aggressive, negative = sellers |
+| **Orderbook** | Orderly WS | L1 Foundational | Imbalance, spread, depth, est. slippage |
+| **OBV** | TAAPI | L1 Foundational | Rising = bullish, divergence = reversal warning |
+| **Fear & Greed** | alternative.me | L1 Sentiment | <25 contrarian buy, >75 contrarian sell |
+| **Spot-Futures Basis** | Orderly WS | L1 Sentiment | >0.1% premium (bullish), <-0.1% discount (bearish) |
+| **L/S Ratio** | Orderly WS | L1 Sentiment | >1.49 crowded longs, <0.67 crowded shorts |
+| **Range Position** | Orderly WS | L1 Filter | Don't short bottom 20%, don't long top 20% of 24h range |
+| **Vol/OI Ratio** | Orderly WS | L1 Filter | High ratio = active turnover, low = stale OI |
+| EMA | Orderly WS | L2 Technical | 9>21>50 = bullish, reverse = bearish |
+| VWAP | Orderly WS | L2 Technical | Above = bullish bias, below = bearish |
+| MACD | Orderly WS | L2 Technical | Crossovers, histogram direction = momentum |
+| ADX | TAAPI | L2 Technical | >25 strong trend, <18 choppy |
+| RSI | Orderly WS | L2 Technical | <40 long zone, >60 short zone, extremes strong |
+| StochRSI | TAAPI | L2 Technical | K<20 oversold (long), K>80 overbought (short) |
+| CCI | TAAPI | L2 Technical | <-100 oversold, >+100 overbought |
+| Bollinger Bands | Orderly WS | L2 Technical | %B <0.3 long, >0.7 short |
+| ATR | Orderly WS | L2 Technical | Volatility for SL/TP placement, TP ≤ 2.5× 1h ATR |
+| Candle trend | Orderly WS | L2 Technical | Consecutive red/green, % change |
 
 ### Cross-Symbol Signals
 

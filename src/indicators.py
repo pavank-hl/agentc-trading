@@ -276,6 +276,10 @@ class IndicatorReport:
 
     ticker_change_24h: float = 0.0
     ticker_volume_24h: float = 0.0
+    ticker_high_24h: float = 0.0
+    ticker_low_24h: float = 0.0
+    range_percentile: float = 50.0  # (mark - low_24h) / (high_24h - low_24h) * 100
+    vol_oi_ratio: float = 0.0       # volume_24h / open_interest
 
     spot_futures_basis_pct: float = 0.0
     fear_greed_index: int = 50
@@ -472,6 +476,23 @@ def compute_indicators(snapshot: MarketSnapshot) -> IndicatorReport:
     # Ticker
     report.ticker_change_24h = snapshot.ticker.change_24h
     report.ticker_volume_24h = snapshot.ticker.volume_24h
+    report.ticker_high_24h = snapshot.ticker.high_24h
+    report.ticker_low_24h = snapshot.ticker.low_24h
+
+    # Range percentile: where is mark price within 24h range?
+    high_low_range = snapshot.ticker.high_24h - snapshot.ticker.low_24h
+    if high_low_range > 0:
+        report.range_percentile = (
+            (snapshot.mark_price - snapshot.ticker.low_24h) / high_low_range * 100
+        )
+    else:
+        report.range_percentile = 50.0
+
+    # Vol/OI ratio
+    if snapshot.open_interest.open_interest > 0:
+        report.vol_oi_ratio = snapshot.ticker.volume_24h / snapshot.open_interest.open_interest
+    else:
+        report.vol_oi_ratio = 0.0
 
     # Spot-futures basis
     if snapshot.index_price > 0:
