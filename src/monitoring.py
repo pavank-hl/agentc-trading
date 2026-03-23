@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -101,8 +104,12 @@ class DecisionMonitoringClient:
             if exc.code == 404:
                 return None
             detail = exc.read().decode("utf-8", errors="ignore")
-            raise RuntimeError(
-                f"Active prompt fetch failed with status {exc.code}: {detail}"
-            ) from exc
+            logger.warning(
+                "Active prompt fetch failed with status %s: %s",
+                exc.code,
+                detail,
+            )
+            return None
         except urllib.error.URLError as exc:
-            raise RuntimeError(f"Active prompt fetch connection failed: {exc}") from exc
+            logger.warning("Active prompt fetch connection failed: %s", exc)
+            return None
