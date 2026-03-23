@@ -296,6 +296,8 @@ class StrategyEngine:
         taapi_client: TaapiClient = None,
         liquidation_tracker: LiquidationTracker | None = None,
         funding_history: FundingHistory | None = None,
+        analysis_prompt: str | None = None,
+        position_prompt: str | None = None,
     ) -> None:
         self.config = config
         self.portfolio = portfolio
@@ -303,6 +305,8 @@ class StrategyEngine:
         self.taapi_client = taapi_client
         self.liquidation_tracker = liquidation_tracker
         self.funding_history = funding_history
+        self.analysis_prompt = analysis_prompt or ANALYSIS_PROMPT
+        self.position_prompt = position_prompt or POSITION_PROMPT
         self.cycles: list[AnalysisCycle] = []
         # Intermediate state between prepare_analysis and process_response
         self._pending_reports: dict[str, IndicatorReport] = {}
@@ -354,7 +358,7 @@ class StrategyEngine:
         self._pending_reports = reports
         self._pending_prices = prices
 
-        return ANALYSIS_PROMPT, user_prompt
+        return self.analysis_prompt, user_prompt
 
     def _enrich_taapi(self, reports: dict[str, IndicatorReport]) -> None:
         """Merge TAAPI indicators into existing reports. No-op if client is None."""
@@ -573,7 +577,7 @@ class StrategyEngine:
             return None
 
         user_prompt = self._build_position_user_prompt(analysis, pos_list)
-        return POSITION_PROMPT, user_prompt
+        return self.position_prompt, user_prompt
 
     def _build_position_user_prompt(
         self,
@@ -685,4 +689,3 @@ class StrategyEngine:
             decisions=decisions,
             raw_response=content,
         )
-

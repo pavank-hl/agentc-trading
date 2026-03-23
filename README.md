@@ -107,6 +107,23 @@ log_level: INFO
 store_reasoning: true
 ```
 
+## Environment Variables
+
+Create an env file from the example:
+
+```bash
+cp .env.example .env
+```
+
+Important values:
+
+- `TAAPI_SECRET` — required for indicator enrichment
+- `VOLT_API_URL` — base URL of the `volt-minions` API
+- `BOT_MONITORING_API_KEY` — bot-only key used to fetch the active prompt version and ingest decision events
+- `PROMPT_VERSION_ID` — optional fallback prompt version id if no active prompt exists yet
+- `USER_ID` — user id attached to monitoring events
+- `AGENT_NAME` — agent label attached to monitoring events
+
 ## Running Tests
 
 ```bash

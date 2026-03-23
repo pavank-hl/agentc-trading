@@ -20,6 +20,7 @@ Usage (from an LLM that can execute Python):
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import os
@@ -29,6 +30,7 @@ from pathlib import Path
 import yaml
 
 from .collector import DataCollector
+from .monitoring import DecisionMonitoringClient
 from .models.config import TradingConfig
 from .models.position import PortfolioState
 from .sentiment import FundingHistory, LiquidationTracker
@@ -83,6 +85,14 @@ class TradingSystem:
         self.funding_history: FundingHistory | None = None
         self._started = False
         self._cycle_count = 0
+        self._last_prompt: str = ""
+        self._last_indicators: dict = {}
+        self._last_symbols: list[str] = []
+        self._last_prices: dict[str, float] = {}
+        self._pending_analysis_event: dict | None = None
+        self._pending_position_event: dict | None = None
+        self.monitoring = DecisionMonitoringClient()
+        self._active_prompt_version_id: str | None = None
 
     async def start(self, stabilization_seconds: int = 10) -> str:
         """Load config, start WebSocket collectors, wait for data.
@@ -120,6 +130,7 @@ class TradingSystem:
             liquidation_tracker=self.liquidation_tracker,
             funding_history=self.funding_history,
         )
+        self._refresh_active_prompt_version()
 
         account_id = self.config.orderly_account_id
 
@@ -188,6 +199,7 @@ class TradingSystem:
             raise RuntimeError("System not started. Call start() first.")
 
         # Get current prices
+        self._refresh_active_prompt_version()
         prices: dict[str, float] = {}
         for symbol, collector in self.collectors.items():
             prices[symbol] = collector.current_price
@@ -201,10 +213,31 @@ class TradingSystem:
         # Build prompts (computes indicators internally)
         system_prompt, user_prompt = self.engine.prepare_analysis(snapshots, prices)
 
+        self._last_symbols = list(self.engine._pending_prices.keys())
+        self._last_indicators = {
+            sym: json.loads(json.dumps(dataclasses.asdict(report), default=float))
+            for sym, report in self.engine._pending_reports.items()
+        }
+        self._last_prompt = user_prompt
+        self._last_prices = prices
+        self._pending_analysis_event = {
+            "step_type": "analysis",
+            "event_timestamp": time.time(),
+            "rendered_prompt": self._rendered_prompt(system_prompt, user_prompt),
+            "normalized_context": {
+                "symbols": list(self._last_symbols),
+                "prices": dict(prices),
+                "indicators": self._last_indicators,
+            },
+        }
+        self._pending_position_event = None
+
         price_str = " | ".join(
             f"{s}: ${p:.2f}" for s, p in prices.items() if p > 0
         )
         logger.info("Prompt generated — Prices: %s", price_str)
+
+        self._cycle_count += 1
 
         return {
             "system_prompt": system_prompt,
@@ -231,6 +264,15 @@ class TradingSystem:
             return None
 
         system_prompt, user_prompt = result
+        self._emit_pending_analysis_event(analysis_json)
+        self._pending_position_event = {
+            "step_type": "position_management",
+            "event_timestamp": time.time(),
+            "rendered_prompt": self._rendered_prompt(system_prompt, user_prompt),
+            "normalized_context": self._build_position_context(
+                analysis_json, positions_json
+            ),
+        }
         logger.info("Position management prompt generated")
         return {
             "system_prompt": system_prompt,
@@ -253,8 +295,8 @@ class TradingSystem:
         if not self._started:
             raise RuntimeError("System not started. Call start() first.")
 
-        self._cycle_count += 1
         validated = self.engine.process_response(response_json)
+        cycle = self.engine.cycles[-1] if self.engine.cycles else None
 
         approved = sum(
             1 for v in validated
@@ -291,7 +333,132 @@ class TradingSystem:
             self._cycle_count, approved, rejected,
         )
 
+        self._emit_submit_event(response_json, cycle)
+
         return result
+
+    def _rendered_prompt(self, system_prompt: str, user_prompt: str) -> str:
+        return (
+            "# SYSTEM PROMPT\n\n"
+            f"{system_prompt}\n\n"
+            "# USER PROMPT\n\n"
+            f"{user_prompt}"
+        )
+
+    def _current_portfolio_state(self) -> dict:
+        if not self.portfolio:
+            return {}
+        return self.portfolio.to_summary_dict(self._last_prices)
+
+    def _build_position_context(self, analysis_json: str, positions_json: str) -> dict:
+        return {
+            "analysis": self._safe_json_loads(analysis_json),
+            "positions": self._safe_json_loads(positions_json),
+        }
+
+    def _safe_json_loads(self, payload: str):
+        try:
+            return json.loads(payload)
+        except json.JSONDecodeError:
+            return {"raw": payload}
+
+    def _serialize_decision(self, decision) -> dict:
+        return {
+            "symbol": decision.symbol,
+            "direction": decision.direction.value,
+            "confidence": decision.confidence,
+            "summary": decision.summary,
+            "leverage": decision.leverage,
+            "positionSize": decision.position_size,
+            "stopLoss": decision.stop_loss,
+            "takeProfit": decision.take_profit,
+            "entryPrice": decision.entry_price,
+            "riskLevel": decision.risk_level,
+        }
+
+    def _build_monitoring_payload(
+        self,
+        event_context: dict,
+        response_json: str,
+        portfolio_state_before: dict | None = None,
+        portfolio_state_after: dict | None = None,
+        error: str | None = None,
+    ) -> dict:
+        if not self.monitoring.config:
+            raise RuntimeError("Monitoring client is not configured")
+
+        parsed = self.engine._parse_response(response_json)
+        return {
+            "promptVersionId": self._active_prompt_version_id
+            or self.monitoring.config.prompt_version_id,
+            "stepType": event_context["step_type"],
+            "userId": os.environ.get("USER_ID", ""),
+            "agentName": os.environ.get("AGENT_NAME", "unknown"),
+            "cycleNumber": self._cycle_count,
+            "eventTimestamp": time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ",
+                time.gmtime(event_context["event_timestamp"]),
+            ),
+            "symbols": self._last_symbols,
+            "renderedPrompt": event_context["rendered_prompt"],
+            "normalizedContext": event_context["normalized_context"],
+            "rawResponse": response_json,
+            "parsedDecisions": [
+                self._serialize_decision(decision)
+                for decision in parsed.decisions
+            ],
+            "portfolioStateBefore": portfolio_state_before,
+            "portfolioStateAfter": portfolio_state_after,
+            "error": error,
+        }
+
+    def _ingest_monitoring_payload(self, payload: dict) -> None:
+        if not self.monitoring.enabled:
+            return
+        self.monitoring.ingest(payload)
+
+    def _refresh_active_prompt_version(self) -> None:
+        if not self.monitoring.enabled or not self.engine:
+            return
+
+        active = self.monitoring.get_active_prompt_version()
+        if not active:
+            return
+
+        self._active_prompt_version_id = active.get("id")
+        strategy_prompt = active.get("strategyPrompt")
+        position_prompt = active.get("positionPrompt")
+        if strategy_prompt:
+            self.engine.analysis_prompt = strategy_prompt
+        if position_prompt:
+            self.engine.position_prompt = position_prompt
+
+    def _emit_pending_analysis_event(self, analysis_json: str) -> None:
+        if not self._pending_analysis_event:
+            return
+        payload = self._build_monitoring_payload(
+            self._pending_analysis_event,
+            analysis_json,
+            portfolio_state_before=self._current_portfolio_state(),
+        )
+        self._ingest_monitoring_payload(payload)
+        self._pending_analysis_event = None
+
+    def _emit_submit_event(self, response_json: str, cycle) -> None:
+        event_context = self._pending_position_event or self._pending_analysis_event
+        if not event_context:
+            return
+
+        payload = self._build_monitoring_payload(
+            event_context,
+            response_json,
+            portfolio_state_before=cycle.portfolio_state_before if cycle else None,
+            portfolio_state_after=cycle.portfolio_state_after if cycle else None,
+            error=cycle.error if cycle else None,
+        )
+        self._ingest_monitoring_payload(payload)
+        self._pending_analysis_event = None
+        self._pending_position_event = None
 
     def get_status(self) -> dict:
         """Get current portfolio and system status."""
