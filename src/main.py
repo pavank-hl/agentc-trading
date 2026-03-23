@@ -223,8 +223,11 @@ class TradingSystem:
         self._pending_analysis_event = {
             "step_type": "analysis",
             "event_timestamp": time.time(),
+            "system_prompt": system_prompt,
+            "strategy_prompt": self.engine.analysis_prompt,
+            "user_prompt": user_prompt,
             "rendered_prompt": self._rendered_prompt(system_prompt, user_prompt),
-            "normalized_context": {
+            "daemon_data": {
                 "symbols": list(self._last_symbols),
                 "prices": dict(prices),
                 "indicators": self._last_indicators,
@@ -268,8 +271,11 @@ class TradingSystem:
         self._pending_position_event = {
             "step_type": "position_management",
             "event_timestamp": time.time(),
+            "system_prompt": system_prompt,
+            "strategy_prompt": self.engine.position_prompt,
+            "user_prompt": user_prompt,
             "rendered_prompt": self._rendered_prompt(system_prompt, user_prompt),
-            "normalized_context": self._build_position_context(
+            "daemon_data": self._build_position_context(
                 analysis_json, positions_json
             ),
         }
@@ -333,7 +339,7 @@ class TradingSystem:
             self._cycle_count, approved, rejected,
         )
 
-        self._emit_submit_event(response_json, cycle)
+        self._emit_submit_event(response_json, cycle, result)
 
         return result
 
@@ -380,6 +386,7 @@ class TradingSystem:
         self,
         event_context: dict,
         response_json: str,
+        decision_result: dict | None = None,
         portfolio_state_before: dict | None = None,
         portfolio_state_after: dict | None = None,
         error: str | None = None,
@@ -389,24 +396,27 @@ class TradingSystem:
 
         parsed = self.engine._parse_response(response_json)
         return {
-            "promptVersionId": self._active_prompt_version_id
-            or self.monitoring.config.prompt_version_id,
-            "stepType": event_context["step_type"],
-            "userId": os.environ.get("USER_ID", ""),
-            "agentName": os.environ.get("AGENT_NAME", "unknown"),
-            "cycleNumber": self._cycle_count,
-            "eventTimestamp": time.strftime(
+            "timestamp": time.strftime(
                 "%Y-%m-%dT%H:%M:%SZ",
                 time.gmtime(event_context["event_timestamp"]),
             ),
+            "userId": os.environ.get("USER_ID", ""),
+            "agentName": os.environ.get("AGENT_NAME", "unknown"),
+            "cycleNumber": self._cycle_count,
+            "stepType": event_context["step_type"],
             "symbols": self._last_symbols,
-            "renderedPrompt": event_context["rendered_prompt"],
-            "normalizedContext": event_context["normalized_context"],
-            "rawResponse": response_json,
-            "parsedDecisions": [
+            "decisions": [
                 self._serialize_decision(decision)
                 for decision in parsed.decisions
             ],
+            "decisionResult": decision_result,
+            "indicators": self._last_indicators,
+            "systemPrompt": event_context["system_prompt"],
+            "strategyPrompt": event_context["strategy_prompt"],
+            "userPrompt": event_context["user_prompt"],
+            "daemonData": event_context["daemon_data"],
+            "rawPrompt": event_context["rendered_prompt"],
+            "rawResponse": response_json,
             "portfolioStateBefore": portfolio_state_before,
             "portfolioStateAfter": portfolio_state_after,
             "error": error,
@@ -439,12 +449,13 @@ class TradingSystem:
         payload = self._build_monitoring_payload(
             self._pending_analysis_event,
             analysis_json,
+            decision_result=None,
             portfolio_state_before=self._current_portfolio_state(),
         )
         self._ingest_monitoring_payload(payload)
         self._pending_analysis_event = None
 
-    def _emit_submit_event(self, response_json: str, cycle) -> None:
+    def _emit_submit_event(self, response_json: str, cycle, decision_result: dict | None = None) -> None:
         event_context = self._pending_position_event or self._pending_analysis_event
         if not event_context:
             return
@@ -452,6 +463,7 @@ class TradingSystem:
         payload = self._build_monitoring_payload(
             event_context,
             response_json,
+            decision_result=decision_result,
             portfolio_state_before=cycle.portfolio_state_before if cycle else None,
             portfolio_state_after=cycle.portfolio_state_after if cycle else None,
             error=cycle.error if cycle else None,
