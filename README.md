@@ -1,6 +1,6 @@
 # Orderly Trader
 
-Perpetual futures trading system on Orderly Network with a callable Python API. Connects to real-time WebSocket market data, computes technical indicators, and exposes functions for an LLM to analyze markets and execute validated trading decisions via the x402 VoltPerps API.
+Perpetual futures trading system on Orderly Network with a collector daemon and a single CLI analysis surface. The daemon keeps market data fresh, while `python -m src.cli analyze ...` is the supported way for an LLM to prepare prompts, validate responses, and record monitoring events before executing trades via the x402 VoltPerps API.
 
 ## Architecture
 
@@ -16,7 +16,7 @@ Orderly WS (x3 symbols) → DataCollectors → MarketSnapshots → Indicators �
 
 - **3 symbols**: PERP_ETH_USDC, PERP_BTC_USDC, PERP_SOL_USDC
 - **3 timeframes**: 5m, 15m, 1h
-- **LLM-controlled cadence**: call `get_prompt()` whenever you want a new analysis
+- **Collector + CLI split**: daemon keeps data fresh, CLI performs every analysis/submit step
 - **9-layer risk manager** with graduated reserve system has absolute veto power
 
 ## Project Structure
@@ -64,22 +64,25 @@ pip install -e ".[dev]"
 
 ## Usage
 
-The system exposes a `TradingSystem` class with callable methods:
+The supported runtime path is:
 
-```python
-from src.main import TradingSystem
+```bash
+# 1. Run the collector daemon once
+.venv/bin/python daemon.py
 
-system = TradingSystem()
-await system.start()           # Connects WebSockets, backfills kline data
+# 2. Create an analysis session from the latest daemon snapshot
+.venv/bin/python -m src.cli analyze prepare
 
-# Each analysis cycle:
-prompt = system.get_prompt()   # Returns {system_prompt, user_prompt}
-# Check positions/balance via VoltPerps API (GET /v1/account/positions, etc.)
-# Analyze, produce JSON decision
-result = system.submit_decision('{"decisions": [...]}')
-# Execute approved trades via x402 VoltPerps API (POST /v1/intent)
+# 3. If positions exist, generate a position-management prompt
+.venv/bin/python -m src.cli analyze prepare-position \
+  --session-file logs/analysis_sessions/<id>.json \
+  --analysis-file analysis.json \
+  --positions-file positions.json
 
-await system.stop()            # Shutdown
+# 4. Submit the final response for validation + monitoring
+.venv/bin/python -m src.cli analyze submit \
+  --session-file logs/analysis_sessions/<id>.json \
+  --response-file decision.json
 ```
 
 See **[SKILL.md](SKILL.md)** for the full skill document with trading rules, signal analysis, and x402 API execution format.
@@ -119,8 +122,7 @@ Important values:
 
 - `TAAPI_SECRET` — required for indicator enrichment
 - `VOLT_API_URL` — base URL of the `volt-minions` API
-- `BOT_MONITORING_API_KEY` — bot-only key used to fetch the active prompt version and ingest decision events
-- `PROMPT_VERSION_ID` — optional fallback prompt version id if no active prompt exists yet
+- `BOT_MONITORING_API_KEY` — bot-only key used to ingest decision events
 - `USER_ID` — user id attached to monitoring events
 - `AGENT_NAME` — agent label attached to monitoring events
 
@@ -135,7 +137,7 @@ python -m pytest tests/ -q      # Quick run
 
 | Decision | Why |
 |----------|-----|
-| Callable API (not autonomous loop) | LLM controls the cadence and makes decisions directly |
+| Collector daemon + CLI | One cached market-data loop, one supported analysis/submit interface |
 | Pure numpy for indicators | 10x lighter than pandas for fixed-size buffers |
 | Multi-symbol single prompt | LLM sees cross-symbol correlations |
 | Graduated reserve system | Capital-efficient. Reserve unlocks based on proven performance. |

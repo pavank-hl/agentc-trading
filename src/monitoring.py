@@ -16,15 +16,13 @@ logger = logging.getLogger(__name__)
 class MonitoringConfig:
     api_url: str
     bot_api_key: str
-    prompt_version_id: str | None = None
 
     @classmethod
     def from_env(cls) -> MonitoringConfig | None:
         api_url = os.environ.get("VOLT_API_URL", "").rstrip("/")
         bot_api_key = os.environ.get("BOT_MONITORING_API_KEY", "")
-        prompt_version_id = os.environ.get("PROMPT_VERSION_ID", "") or None
 
-        if not api_url and not bot_api_key and not prompt_version_id:
+        if not api_url and not bot_api_key:
             return None
 
         missing = [
@@ -41,11 +39,7 @@ class MonitoringConfig:
                 + ", ".join(missing)
             )
 
-        return cls(
-            api_url=api_url,
-            bot_api_key=bot_api_key,
-            prompt_version_id=prompt_version_id,
-        )
+        return cls(api_url=api_url, bot_api_key=bot_api_key)
 
 
 class DecisionMonitoringClient:
@@ -83,33 +77,3 @@ class DecisionMonitoringClient:
             ) from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"Monitoring ingest connection failed: {exc}") from exc
-
-    def get_active_prompt_version(self) -> dict | None:
-        if not self.config:
-            return None
-
-        req = urllib.request.Request(
-            f"{self.config.api_url}/monitoring/prompt-version/active",
-            headers={"X-Bot-Api-Key": self.config.bot_api_key},
-            method="GET",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                if resp.status != 200:
-                    raise RuntimeError(
-                        f"Active prompt fetch returned unexpected status {resp.status}"
-                    )
-                return json.loads(resp.read().decode())
-        except urllib.error.HTTPError as exc:
-            if exc.code == 404:
-                return None
-            detail = exc.read().decode("utf-8", errors="ignore")
-            logger.warning(
-                "Active prompt fetch failed with status %s: %s",
-                exc.code,
-                detail,
-            )
-            return None
-        except urllib.error.URLError as exc:
-            logger.warning("Active prompt fetch connection failed: %s", exc)
-            return None

@@ -14,7 +14,6 @@ class TestDecisionMonitoringClient:
             MonitoringConfig(
                 api_url="http://localhost:3000",
                 bot_api_key="secret",
-                prompt_version_id="prompt-1",
             )
         )
         called = {}
@@ -47,7 +46,6 @@ class TestDecisionMonitoringClient:
             MonitoringConfig(
                 api_url="http://localhost:3000",
                 bot_api_key="secret",
-                prompt_version_id="prompt-1",
             )
         )
 
@@ -71,11 +69,11 @@ class TestTradingSystemMonitoringPayload:
         system = TradingSystem()
         system._cycle_count = 3
         system._last_symbols = ["PERP_ETH_USDC"]
+        system._last_indicators = {"PERP_ETH_USDC": {"fear_greed_index": 42}}
         system.monitoring = DecisionMonitoringClient(
             MonitoringConfig(
                 api_url="http://localhost:3000",
                 bot_api_key="secret",
-                prompt_version_id="prompt-1",
             )
         )
         system.engine = SimpleNamespace(
@@ -101,29 +99,32 @@ class TestTradingSystemMonitoringPayload:
             {
                 "step_type": "analysis",
                 "event_timestamp": 1_700_000_000,
+                "system_prompt": "sys",
+                "strategy_prompt": "strategy",
+                "user_prompt": "user",
                 "rendered_prompt": "prompt",
-                "normalized_context": {"symbols": ["PERP_ETH_USDC"]},
+                "daemon_data": {"symbols": ["PERP_ETH_USDC"]},
             },
             '{"decisions":[{"symbol":"PERP_ETH_USDC","direction":"LONG"}]}',
             portfolio_state_before={"margin_in_use": 0},
             portfolio_state_after={"margin_in_use": 10},
         )
 
-        assert payload["promptVersionId"] == "prompt-1"
         assert payload["stepType"] == "analysis"
         assert payload["cycleNumber"] == 3
-        assert payload["parsedDecisions"][0]["direction"] == "LONG"
+        assert payload["decisions"][0]["direction"] == "LONG"
         assert payload["portfolioStateAfter"]["margin_in_use"] == 10
+        assert payload["strategyPrompt"] == "strategy"
 
     def test_build_position_payload(self):
         system = TradingSystem()
         system._cycle_count = 4
         system._last_symbols = ["PERP_BTC_USDC"]
+        system._last_indicators = {"PERP_BTC_USDC": {"fear_greed_index": 55}}
         system.monitoring = DecisionMonitoringClient(
             MonitoringConfig(
                 api_url="http://localhost:3000",
                 bot_api_key="secret",
-                prompt_version_id="prompt-2",
             )
         )
         system.engine = SimpleNamespace(
@@ -143,12 +144,15 @@ class TestTradingSystemMonitoringPayload:
             {
                 "step_type": "position_management",
                 "event_timestamp": 1_700_000_010,
+                "system_prompt": "sys",
+                "strategy_prompt": "position-strategy",
+                "user_prompt": "position-user",
                 "rendered_prompt": "position-prompt",
-                "normalized_context": {"analysis": {"decisions": []}},
+                "daemon_data": {"analysis": {"decisions": []}},
             },
             '{"decisions":[{"symbol":"PERP_BTC_USDC","direction":"HOLD"}]}',
         )
 
-        assert payload["promptVersionId"] == "prompt-2"
         assert payload["stepType"] == "position_management"
-        assert payload["parsedDecisions"][0]["direction"] == "HOLD"
+        assert payload["decisions"][0]["direction"] == "HOLD"
+        assert payload["userPrompt"] == "position-user"

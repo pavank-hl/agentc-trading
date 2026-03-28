@@ -7,20 +7,20 @@ The trading system uses two separate LLM prompts per cycle:
 1. **Prompt 1 (Analysis):** Pure market analysis. Always outputs LONG or SHORT for every symbol with confidence 0-100 and full trade params. No awareness of existing positions.
 2. **Prompt 2 (Position Management):** Only runs when positions exist. Receives the analysis result + current position data. Compares and decides: HOLD, CLOSE, or output a new direction (for reversals/opens).
 
-Both prompts output the same `{"decisions": [...]}` JSON format, so `submit_decision()` works unchanged for both paths.
+Both prompts output the same `{"decisions": [...]}` JSON format. The supported runtime path is the CLI session flow, not direct `TradingSystem` calls.
 
 ## Flow
 
 ```
-1. prompt = system.get_prompt()                    # Analysis prompt
-2. LLM analyzes → analysis_json                    # Call #1: always LONG/SHORT
+1. `python -m src.cli analyze prepare`            # Analysis prompt from daemon snapshot
+2. LLM analyzes → `analysis.json`                 # Call #1: always LONG/SHORT
 3. Fetch positions via GET /v1/account/positions
 4. IF positions exist:
-     pos_prompt = system.get_position_prompt(analysis_json, positions_json)
-     LLM evaluates → decision_json                 # Call #2: HOLD/CLOSE/LONG/SHORT
-     result = system.submit_decision(decision_json)
+     `python -m src.cli analyze prepare-position ...`
+     LLM evaluates → `decision.json`              # Call #2: HOLD/CLOSE/LONG/SHORT
+     `python -m src.cli analyze submit ...`
    ELSE:
-     result = system.submit_decision(analysis_json) # Use analysis directly
+     `python -m src.cli analyze submit ...`       # Use analysis directly
 5. Execute approved trades (close first if reversing, then open)
 6. Verify via GET /v1/account/positions
 ```

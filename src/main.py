@@ -1,21 +1,4 @@
-"""TradingSystem: callable Python API for LLM-orchestrated trading.
-
-Usage (from an LLM that can execute Python):
-
-    from src.main import TradingSystem
-
-    system = TradingSystem()
-    await system.start()
-
-    # Each analysis cycle:
-    prompt = system.get_prompt()        # Market data + indicators
-    # Check positions/balance via VoltPerps API (GET /v1/account/positions, etc.)
-    # Analyze prompt["system_prompt"] + prompt["user_prompt"], produce JSON
-    result = system.submit_decision('{"decisions": [...]}')
-    # Execute approved trades via x402 VoltPerps API (POST /v1/intent)
-
-    await system.stop()
-"""
+"""TradingSystem: collector-backed runtime plus reusable analysis snapshots."""
 
 from __future__ import annotations
 
@@ -30,6 +13,12 @@ from pathlib import Path
 import yaml
 
 from .collector import DataCollector
+from .indicators import (
+    DerivativesAnalysis,
+    IndicatorReport,
+    OrderbookAnalysis,
+    TimeframeIndicators,
+)
 from .monitoring import DecisionMonitoringClient
 from .models.config import TradingConfig
 from .models.position import PortfolioState
@@ -69,10 +58,11 @@ def setup_logging(level: str) -> None:
 
 
 class TradingSystem:
-    """Callable trading system for LLM orchestration.
+    """Collector-backed trading runtime.
 
-    The LLM controls the cadence — call get_prompt() whenever you want
-    a new analysis, then submit_decision() with your JSON response.
+    The daemon keeps market data fresh and writes analysis snapshots.
+    The CLI restores those snapshots to run analysis / submit flows
+    without starting a second live trading system.
     """
 
     def __init__(self) -> None:
@@ -92,7 +82,6 @@ class TradingSystem:
         self._pending_analysis_event: dict | None = None
         self._pending_position_event: dict | None = None
         self.monitoring = DecisionMonitoringClient()
-        self._active_prompt_version_id: str | None = None
 
     async def start(self, stabilization_seconds: int = 10) -> str:
         """Load config, start WebSocket collectors, wait for data.
@@ -130,7 +119,6 @@ class TradingSystem:
             liquidation_tracker=self.liquidation_tracker,
             funding_history=self.funding_history,
         )
-        self._refresh_active_prompt_version()
 
         account_id = self.config.orderly_account_id
 
@@ -199,7 +187,6 @@ class TradingSystem:
             raise RuntimeError("System not started. Call start() first.")
 
         # Get current prices
-        self._refresh_active_prompt_version()
         prices: dict[str, float] = {}
         for symbol, collector in self.collectors.items():
             prices[symbol] = collector.current_price
@@ -246,6 +233,39 @@ class TradingSystem:
             "system_prompt": system_prompt,
             "user_prompt": user_prompt,
         }
+
+    def export_analysis_state(self) -> dict:
+        if not self.engine:
+            raise RuntimeError("System not initialized")
+
+        return {
+            "cycleNumber": self._cycle_count,
+            "generatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "symbols": list(self._last_symbols),
+            "prices": dict(self._last_prices),
+            "indicators": self._last_indicators,
+            "analysisPrompt": self.engine.analysis_prompt,
+            "positionPrompt": self.engine.position_prompt,
+            "pendingAnalysisEvent": self._pending_analysis_event,
+            "pendingPositionEvent": self._pending_position_event,
+            "portfolioState": self._current_portfolio_state(),
+        }
+
+    @classmethod
+    def from_analysis_state(cls, state: dict) -> "TradingSystem":
+        system = cls()
+        system.config = load_config()
+        setup_logging(system.config.log_level)
+        system.portfolio = PortfolioState()
+        system.engine = StrategyEngine(
+            system.config,
+            system.portfolio,
+            analysis_prompt=state.get("analysisPrompt"),
+            position_prompt=state.get("positionPrompt"),
+        )
+        system._load_analysis_state(state)
+        system._started = True
+        return system
 
     def get_position_prompt(self, analysis_json: str, positions_json: str) -> dict | None:
         """Build position management prompt for LLM call #2.
@@ -395,7 +415,7 @@ class TradingSystem:
             raise RuntimeError("Monitoring client is not configured")
 
         parsed = self.engine._parse_response(response_json)
-        return {
+        payload = {
             "timestamp": time.strftime(
                 "%Y-%m-%dT%H:%M:%SZ",
                 time.gmtime(event_context["event_timestamp"]),
@@ -417,31 +437,21 @@ class TradingSystem:
             "daemonData": event_context["daemon_data"],
             "rawPrompt": event_context["rendered_prompt"],
             "rawResponse": response_json,
-            "portfolioStateBefore": portfolio_state_before,
-            "portfolioStateAfter": portfolio_state_after,
-            "error": error,
         }
+        if decision_result is not None:
+            payload["decisionResult"] = decision_result
+        if portfolio_state_before is not None:
+            payload["portfolioStateBefore"] = portfolio_state_before
+        if portfolio_state_after is not None:
+            payload["portfolioStateAfter"] = portfolio_state_after
+        if error is not None:
+            payload["error"] = error
+        return payload
 
     def _ingest_monitoring_payload(self, payload: dict) -> None:
         if not self.monitoring.enabled:
             return
         self.monitoring.ingest(payload)
-
-    def _refresh_active_prompt_version(self) -> None:
-        if not self.monitoring.enabled or not self.engine:
-            return
-
-        active = self.monitoring.get_active_prompt_version()
-        if not active:
-            return
-
-        self._active_prompt_version_id = active.get("id")
-        strategy_prompt = active.get("strategyPrompt")
-        position_prompt = active.get("positionPrompt")
-        if strategy_prompt:
-            self.engine.analysis_prompt = strategy_prompt
-        if position_prompt:
-            self.engine.position_prompt = position_prompt
 
     def _emit_pending_analysis_event(self, analysis_json: str) -> None:
         if not self._pending_analysis_event:
@@ -489,6 +499,26 @@ class TradingSystem:
         summary["system_running"] = self._started
         return summary
 
+    def _load_analysis_state(self, state: dict) -> None:
+        if not self.engine:
+            raise RuntimeError("Engine not initialized")
+
+        indicators = state.get("indicators", {}) or {}
+        prices = state.get("prices", {}) or {}
+
+        self._cycle_count = int(state.get("cycleNumber", 0))
+        self._last_symbols = list(state.get("symbols", []) or [])
+        self._last_indicators = indicators
+        self._last_prices = {symbol: float(price) for symbol, price in prices.items()}
+        self._pending_analysis_event = state.get("pendingAnalysisEvent")
+        self._pending_position_event = state.get("pendingPositionEvent")
+
+        self.engine._pending_reports = {
+            symbol: _deserialize_indicator_report(report)
+            for symbol, report in indicators.items()
+        }
+        self.engine._pending_prices = dict(self._last_prices)
+
 
 def _save_cycle_log(cycle, cycle_num: int) -> None:
     """Append cycle data to a JSONL log file."""
@@ -518,3 +548,28 @@ def _save_cycle_log(cycle, cycle_num: int) -> None:
 
     with open(log_file, "a") as f:
         f.write(json.dumps(record, default=str) + "\n")
+
+
+def _deserialize_indicator_report(payload: dict) -> IndicatorReport:
+    timeframes = {
+        timeframe: TimeframeIndicators(**data)
+        for timeframe, data in (payload.get("timeframes") or {}).items()
+    }
+    return IndicatorReport(
+        symbol=payload.get("symbol", ""),
+        mark_price=float(payload.get("mark_price", 0.0)),
+        index_price=float(payload.get("index_price", 0.0)),
+        timeframes=timeframes,
+        orderbook=OrderbookAnalysis(**(payload.get("orderbook") or {})),
+        derivatives=DerivativesAnalysis(**(payload.get("derivatives") or {})),
+        volume_delta=float(payload.get("volume_delta", 0.0)),
+        volume_delta_ratio=float(payload.get("volume_delta_ratio", 0.0)),
+        ticker_change_24h=float(payload.get("ticker_change_24h", 0.0)),
+        ticker_volume_24h=float(payload.get("ticker_volume_24h", 0.0)),
+        ticker_high_24h=float(payload.get("ticker_high_24h", 0.0)),
+        ticker_low_24h=float(payload.get("ticker_low_24h", 0.0)),
+        range_percentile=float(payload.get("range_percentile", 50.0)),
+        vol_oi_ratio=float(payload.get("vol_oi_ratio", 0.0)),
+        spot_futures_basis_pct=float(payload.get("spot_futures_basis_pct", 0.0)),
+        fear_greed_index=int(payload.get("fear_greed_index", 50)),
+    )
